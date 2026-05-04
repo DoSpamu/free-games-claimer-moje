@@ -1,6 +1,6 @@
 // https://stackoverflow.com/questions/46745014/alternative-for-dirname-in-node-js-when-using-es6-modules
 import path from 'node:path';
-import { chromium } from 'patchright';
+// patchright loaded lazily inside launchBrowser so test environments without the package can still import this module
 import { fileURLToPath } from 'node:url';
 import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
 import { promises as fsp } from 'node:fs';
@@ -448,6 +448,7 @@ export const log = {
 };
 
 export const launchBrowser = async (options = {}) => {
+  const { chromium } = await import('patchright');
   const { browserDir, harPrefix, extraArgs = [], headless = cfg.headless, deviceOptions = {} } = options;
   return chromium.launchPersistentContext(browserDir ?? cfg.dir.browser, {
     headless,
