@@ -1,4 +1,5 @@
 import { writeFileSync } from 'node:fs';
+import { authenticator } from 'otplib';
 import { resolve, jsonDb, datetime, filenamify, prompt, notify, html_game_list, handleSIGINT, clearBrowserLock, closeContextSafely, writeLastRun, log, dataDir, launchBrowser } from './src/util.js';
 import { cfg } from './src/config.js';
 
@@ -268,7 +269,9 @@ try {
       await page.locator('button[type="submit"], button:has-text("Sign in")').first().click();
       page.waitForSelector('[class*="newlogindialog_AwaitingMobileConfLabel"], [class*="segmentedinputs"]').then(async () => {
         log.info('Steam Guard — enter the code from your authenticator app or email');
-        const code = await prompt({ type: 'text', message: 'Enter Steam Guard code', validate: n => n.toString().length == 5 || 'The code must be 5 characters!' });
+        const code = (cfg.steam_otpkey && authenticator.generate(cfg.steam_otpkey))
+          || await prompt({ type: 'text', message: 'Enter Steam Guard code', validate: n => n.toString().length == 5 || 'The code must be 5 characters!' });
+        if (cfg.steam_otpkey && code) log.info('Steam Guard: used TOTP from STEAM_OTPKEY');
         if (code) {
           const inputs = await page.locator('[class*="segmentedinputs"] input').all();
           if (inputs.length > 0) {
