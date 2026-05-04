@@ -13,6 +13,11 @@ import { describeConfig, patchConfig, describeEnv, getSchedulerConfig, CONFIG_FI
 
 const cb = makeCBHelpers(dataDir('circuit-breaker.json'));
 
+const _sessionCache = new Map(); // siteId → { result: {loggedIn, user}, expiresAt }
+const SESSION_TTL_MS = { loggedIn: 30 * 60 * 1000, loggedOut: 5 * 60 * 1000 };
+
+function invalidateSession(siteId) { _sessionCache.delete(siteId); }
+
 const PANEL_PORT = Number(process.env.PANEL_PORT) || 7080;
 const NOVNC_PORT = process.env.NOVNC_PORT || 6080;
 const PANEL_PASSWORD = process.env.PANEL_PASSWORD || process.env.VNC_PASSWORD || '';
@@ -431,7 +436,14 @@ async function checkSiteStatus(siteId) {
     });
 
     const page = context.pages()[0] || await context.newPage();
-    const result = await site.checkLogin(page);
+    const cached = _sessionCache.get(siteId);
+    const result = (cached && Date.now() < cached.expiresAt)
+      ? cached.result
+      : await site.checkLogin(page).then(r => {
+          const ttl = r.loggedIn ? SESSION_TTL_MS.loggedIn : SESSION_TTL_MS.loggedOut;
+          _sessionCache.set(siteId, { result: r, expiresAt: Date.now() + ttl });
+          return r;
+        });
     siteStatus[siteId] = {
       status: result.loggedIn ? 'logged_in' : 'not_logged_in',
       user: result.user || null,
@@ -3680,12 +3692,14 @@ const server = http.createServer(async (req, res) => {
         sendJson(res, { error: 'Invalid site.' }, 400);
         return;
       }
+      invalidateSession(site); // user explicitly requested a fresh check
       const result = await checkSiteStatus(site);
       sendJson(res, result);
       return;
     }
 
     if (req.method === 'POST' && req.url === '/api/check-all') {
+      Object.keys(SITES).forEach(id => invalidateSession(id)); // fresh check for all
       const results = await checkAllSites();
       sendJson(res, results);
       return;
