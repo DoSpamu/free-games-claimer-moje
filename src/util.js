@@ -1,7 +1,9 @@
 // https://stackoverflow.com/questions/46745014/alternative-for-dirname-in-node-js-when-using-es6-modules
 import path from 'node:path';
+import { chromium } from 'patchright';
 import { fileURLToPath } from 'node:url';
 import { existsSync, unlinkSync, writeFileSync } from 'node:fs';
+import { promises as fsp } from 'node:fs';
 import { createRequire } from 'node:module';
 const _require = createRequire(import.meta.url);
 const { FingerprintGenerator } = _require('fingerprint-generator');
@@ -32,15 +34,13 @@ export const generateFingerprint = (width = 1920, height = 1080) => {
   } catch (_) { /* non-critical */ }
   return fp;
 };
-// not the same since these will give the absolute paths for this file instead of for the file using them
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
-// explicit object instead of Object.fromEntries since the built-in type would loose the keys, better type: https://dev.to/svehla/typescript-object-fromentries-389c
 export const dataDir = s => path.resolve(__dirname, '..', 'data', s);
 
 // Remove stale browser profile lock left behind by a crashed/killed previous run.
 // Firefox uses parent.lock, Chromium/patchright uses SingletonLock.
-// On Windows the file is held open by the process, so if removal fails the profile is still in use.
 export const clearBrowserLock = (dir) => {
   for (const lockName of ['parent.lock', 'SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
     const lockFile = path.join(dir, lockName);
@@ -79,10 +79,24 @@ export const datetimeUTC = (d = new Date()) => d.toISOString().replace('T', ' ')
 export const datetime = (d = new Date()) => datetimeUTC(new Date(d.getTime() - d.getTimezoneOffset() * 60000));
 export const filenamify = s => s.replaceAll(':', '.').replace(/[^a-z0-9 _\-.]/gi, '_'); // alternative: https://www.npmjs.com/package/filenamify - On Unix-like systems, / is reserved. On Windows, <>:"/\|?* along with trailing periods are reserved.
 
+// Race context.close() with a timeout. Some sites (e.g. Epic Store) keep service workers and
+// long-poll websockets alive, which withholds the renderer's close-ack and hangs context.close()
+// indefinitely. Page-level finalization (video, HAR) has already flushed by the time we get here,
+// so on timeout we warn and let the process exit.
+export const closeContextSafely = async (context, timeoutMs = 15000) => {
+  const closed = await Promise.race([
+    context.close().then(() => true, () => true),
+    new Promise(r => setTimeout(() => r(false), timeoutMs)),
+  ]);
+  if (!closed) console.warn(`context.close() timed out after ${timeoutMs}ms — forcing exit (likely a stuck service worker)`);
+  return closed;
+};
+
 export const handleSIGINT = (context = null) => process.on('SIGINT', async () => { // e.g. when killed by Ctrl-C
   console.error('\nInterrupted by SIGINT. Exit!');
   process.exitCode = 130; // 128+SIGINT to indicate to parent that process was killed
-  if (context) await context.close(); // in order to save recordings also on SIGINT, we need to disable Playwright's handleSIGINT and close the context ourselves
+  if (context) await closeContextSafely(context); // in order to save recordings also on SIGINT, we need to disable Playwright's handleSIGINT and close the context ourselves
+  process.exit(process.exitCode);
 });
 
 // Retry wrapper - retries an async function on failure with delay between attempts.
@@ -107,17 +121,14 @@ export const stealth = async (context, fingerprint = null) => {
     'chrome.csi',
     'chrome.loadTimes',
     'chrome.runtime', // partially broken in Chrome 100+, patched below
-    // 'defaultArgs',
     'iframe.contentWindow',
     'media.codecs',
     'navigator.hardwareConcurrency',
     'navigator.languages',
     'navigator.permissions',
     'navigator.plugins',
-    // 'navigator.vendor',
     'navigator.webdriver',
     'sourceurl',
-    // 'user-agent-override', // doesn't work since playwright has no page.browser()
     'webgl.vendor',
     'window.outerdimensions',
   ];
@@ -138,14 +149,11 @@ export const stealth = async (context, fingerprint = null) => {
   // fingerprint-injector: injects canvas fingerprint, WebGL renderer/vendor, font metrics,
   // navigator properties (hardwareConcurrency, deviceMemory, languages, plugins, etc.)
   // and sets matching sec-ch-ua / user-agent HTTP headers.
-  // Must run BEFORE the chrome.runtime patch so the patch isn't overwritten.
   if (fingerprint) {
     await _fingerprintInjector.attachFingerprintToPlaywright(context, fingerprint);
   }
 
   // chrome.runtime patch: puppeteer-extra-plugin-stealth's version is broken in Chrome 100+
-  // because the real runtime object structure changed. We patch it manually.
-  // Without this, bot detectors see window.chrome.runtime === undefined which is detectable.
   await context.addInitScript(() => {
     if (!window.chrome) return;
     if (window.chrome.runtime && window.chrome.runtime.PlatformOs) return; // already set correctly (non-headless real Chrome)
@@ -191,47 +199,44 @@ export const confirm = o => prompt({ type: 'confirm', message: 'Continue?', ...o
 
 // notifications via apprise CLI (set NOTIFY env var)
 import { execFile } from 'child_process';
+import chalk from 'chalk';
 import { cfg } from './config.js';
 
-export const notify = html => {
-  notifyTelegram(html).catch(_ => {}); // fire-and-forget Telegram in parallel
-  if (!cfg.notify) {
-    if (cfg.debug) console.debug('notify: NOTIFY is not set!');
-    return Promise.resolve();
-  }
-  return new Promise((resolve, reject) => {
-    const args = [cfg.notify, '-i', 'html', '-b', `'${html}'`];
-    if (cfg.notify_title) args.push(...['-t', cfg.notify_title]);
-    if (cfg.debug) console.debug(`apprise ${args.map(a => `'${a}'`).join(' ')}`);
-    execFile('apprise', args, (error, stdout, stderr) => {
-      if (error) {
-        console.log(`error: ${error.message}`);
-        if (error.message.includes('command not found')) {
-          console.info('Run `pip install apprise` or set TG_TOKEN+TG_CHAT_ID for Telegram. See README.');
-        }
-        return reject(error);
-      }
-      if (stderr) console.error(`stderr: ${stderr}`);
-      if (stdout) console.log(`stdout: ${stdout}`);
-      resolve();
-    });
-  });
+// Walk cfg.dir.screenshots recursively for the newest PNG with mtime >= this
+// process's start time. Used by notify() when callers pass
+// { attachLatestScreenshot: true } so error notifications carry the visual
+// state of the failure without each call site needing to track a path.
+const findLatestScreenshot = async () => {
+  const root = cfg.dir?.screenshots;
+  if (!root || root === '0') return null;
+  const cutoff = Date.now() - process.uptime() * 1000;
+  const walk = async dir => {
+    let entries;
+    try { entries = await fsp.readdir(dir, { withFileTypes: true }); }
+    catch { return []; }
+    const found = await Promise.all(entries.map(async e => {
+      const full = path.join(dir, e.name);
+      if (e.isDirectory()) return walk(full);
+      if (!e.isFile() || !e.name.toLowerCase().endsWith('.png')) return [];
+      const s = await fsp.stat(full).catch(() => null);
+      return s && s.mtimeMs >= cutoff ? [{ path: full, mtime: s.mtimeMs }] : [];
+    }));
+    return found.flat();
+  };
+  const files = await walk(root);
+  if (!files.length) return null;
+  files.sort((a, b) => b.mtime - a.mtime);
+  return files[0].path;
 };
 
 // Direct Telegram notification without Apprise (set TG_TOKEN and TG_CHAT_ID env vars).
-// Works independently of NOTIFY/apprise - can be used alongside or as replacement.
 export const notifyTelegram = async (html) => {
   if (!cfg.tg_token || !cfg.tg_chat_id) return;
   try {
     const res = await fetch(`https://api.telegram.org/bot${cfg.tg_token}/sendMessage`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        chat_id: cfg.tg_chat_id,
-        text: html,
-        parse_mode: 'HTML',
-        disable_web_page_preview: true,
-      }),
+      body: JSON.stringify({ chat_id: cfg.tg_chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: true }),
     });
     if (!res.ok) console.error('Telegram notification error:', await res.text());
   } catch (e) {
@@ -239,6 +244,177 @@ export const notifyTelegram = async (html) => {
   }
 };
 
+export const notify = (html, opts = {}) => {
+  notifyTelegram(html).catch(() => {}); // fire-and-forget — runs in parallel with Apprise
+  if (!cfg.notify) {
+    if (cfg.debug) console.debug('notify: NOTIFY is not set!');
+    return Promise.resolve();
+  }
+  // Resolve attachment path (if any) before invoking apprise. Explicit
+  // opts.screenshot always wins; attachLatestScreenshot is the autopilot
+  // path and is gated by cfg.notify_attach_screenshots so users can opt
+  // out of attachments globally (privacy / bandwidth / target limits).
+  const wantLatest = opts.attachLatestScreenshot && cfg.notify_attach_screenshots !== false;
+  const attachPromise = opts.screenshot
+    ? Promise.resolve(opts.screenshot)
+    : wantLatest
+      ? findLatestScreenshot().catch(() => null)
+      : Promise.resolve(null);
+  return attachPromise.then(attachPath => new Promise((resolve, reject) => {
+    const args = [cfg.notify, '-i', 'html', '-b', html];
+    if (cfg.notify_title) args.push('-t', cfg.notify_title);
+    if (attachPath) args.push('-a', attachPath);
+    if (cfg.debug) console.debug(`apprise ${args.map(a => `'${a}'`).join(' ')}`);
+    execFile('apprise', args, (error, stdout, stderr) => {
+      if (error) {
+        console.log(`error: ${error.message}`);
+        if (error.message.includes('command not found')) {
+          console.info('Run `pip install apprise`. See https://github.com/vogler/free-games-claimer#notifications');
+        }
+        return reject(error);
+      }
+      if (stderr) console.error(`stderr: ${stderr}`);
+      if (stdout) console.log(`stdout: ${stdout}`);
+      resolve();
+    });
+  }));
+};
+
 export const escapeHtml = unsafe => unsafe.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('"', '&quot;').replaceAll('\'', '&#039;');
 
-export const html_game_list = games => games.map(g => `- <a href="${escapeHtml(g.url)}">${escapeHtml(g.title)}</a> (${g.status})`).join('<br>'); // status may intentionally contain HTML (e.g. redeem links from prime-gaming)
+// Captcha pause helper. Per-service state machine in process memory drives
+// whether the helper actively engages the user (notify + wait + poll) or
+// short-circuits with a deferred-form push notification so the user can
+// process the captcha manually later.
+const _captchaServiceState = new Map(); // service -> 'engaged' | 'abandoned'
+const _captchaDeepLink = () => cfg.public_url ? `${cfg.public_url}/?focus=captcha` : null;
+const _captchaNotifyBody = (service, label, kind) => {
+  const url = _captchaDeepLink();
+  const intro = kind === 'urgent'
+    ? `${escapeHtml(service)} captcha: ${escapeHtml(label)} — solve now`
+    : `${escapeHtml(service)} captcha: ${escapeHtml(label)} — solve later when you can`;
+  return url ? `${intro}<br>${url}` : `${intro}. Open the panel to solve.`;
+};
+export const awaitUserCaptchaSolve = async (page, {
+  service,
+  label = 'verification',
+  captchaCheck,
+  timeoutMs = 10 * 60 * 1000,
+  pollMs = 1000,
+}) => {
+  if (!service) throw new Error('awaitUserCaptchaSolve: service is required');
+  if (typeof captchaCheck !== 'function') throw new Error('awaitUserCaptchaSolve: captchaCheck function is required');
+
+  // Skip the whole dance if the captcha isn't actually visible.
+  if (!(await captchaCheck())) return true;
+
+  const safeLabel = String(label).replace(/\s+/g, ' ').slice(0, 200);
+  const state = _captchaServiceState.get(service); // undefined = fresh
+
+  // Abandoned path — user gave up earlier. Single deferred notification so
+  // they have a record + link, then return false without blocking.
+  if (state === 'abandoned') {
+    notify(_captchaNotifyBody(service, safeLabel, 'deferred'))
+      .catch(e => console.error(`captcha notify (deferred) failed: ${e.message}`));
+    return false;
+  }
+
+  // Engagement path — fresh or previously engaged. Banner + urgent notify + poll.
+  console.log(`[CAPTCHA-START] service=${service} label=${safeLabel}`);
+  notify(_captchaNotifyBody(service, safeLabel, 'urgent'))
+    .catch(e => console.error(`captcha notify (urgent) failed: ${e.message}`));
+
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await delay(pollMs);
+    let visible;
+    try { visible = await captchaCheck(); }
+    catch { visible = true; } // err on the side of waiting through transient errors
+    if (!visible) {
+      _captchaServiceState.set(service, 'engaged');
+      console.log(`[CAPTCHA-END] service=${service} reason=solved`);
+      return true;
+    }
+  }
+
+  // Timed out — flip to abandoned, fire a deferred follow-up so this missed
+  // captcha doesn't disappear from the user's awareness, return false.
+  _captchaServiceState.set(service, 'abandoned');
+  console.log(`[CAPTCHA-END] service=${service} reason=timeout`);
+  notify(_captchaNotifyBody(service, safeLabel, 'deferred'))
+    .catch(e => console.error(`captcha notify (deferred) failed: ${e.message}`));
+  return false;
+};
+
+// Normalize a game title for fuzzy cross-store matching: lowercase, collapse
+// separators/punctuation/whitespace. Used to reconcile Prime Gaming entries
+// against the authenticated GOG library where exact punctuation / edition
+// suffixes may differ between stores.
+export const normalizeTitle = s => (s || '')
+  .toLowerCase()
+  .replace(/[:;\-–—_/\\]/g, ' ')
+  .replace(/['".,!?()[\]®™©]/g, '')
+  .replace(/\s+/g, ' ')
+  .trim();
+
+export const html_game_list = games => games.map(g => {
+  if (g.status === 'action') return `<b><a href="${g.url}">${escapeHtml(g.title)}</a></b>`;
+  let line = `- <a href="${g.url}">${escapeHtml(g.title)}</a> (${g.status})`;
+  if (g.details) line += `<br>  ${g.details}`;
+  return line;
+}).join('<br>');
+
+const SECTION_WIDTH = 50;
+export const log = {
+  section: (title) => {
+    const pad = SECTION_WIDTH - title.length - 5;
+    console.log(`\n${'─'.repeat(3)} ${title} ${'─'.repeat(Math.max(3, pad))}`);
+  },
+  sectionEnd: () => {
+    console.log('─'.repeat(SECTION_WIDTH));
+  },
+  status: (label, value) => {
+    console.log(`  ${label}: ${value}`);
+  },
+  info: (msg) => {
+    console.log(`  ${chalk.green('✓')} ${msg}`);
+  },
+  game: (name, status) => {
+    console.log(`    ${chalk.blue(name)} ${chalk.dim('→')} ${status}`);
+  },
+  skip: (name, reason) => {
+    console.log(`    ${chalk.red('✗')} ${chalk.dim(name)} — ${chalk.yellow(reason)}`);
+  },
+  ok: (msg) => {
+    console.log(`    ${chalk.green('✓')} ${msg}`);
+  },
+  warn: (msg) => {
+    console.log(`    ${chalk.yellow('!')} ${msg}`);
+  },
+  fail: (msg) => {
+    console.log(`  ${chalk.red('✗')} ${msg}`);
+  },
+  summary: (parts) => {
+    console.log(`  ${chalk.dim('Summary:')} ${parts.join(', ')}`);
+  },
+  // Progressive line helpers — write pieces without newline, then end the line.
+  // Use these when you want log output to appear incrementally (e.g. during sleeps).
+  progressStart: (msg) => process.stdout.write(`  ${msg}`),
+  progressAppend: (msg) => process.stdout.write(msg),
+  progressEnd: (msg = '') => process.stdout.write(`${msg}\n`),
+  progressInfo: (msg) => process.stdout.write(`  ${chalk.green('✓')} ${msg}`),
+};
+
+export const launchBrowser = async (options = {}) => {
+  const { browserDir, harPrefix, extraArgs = [], headless = cfg.headless, deviceOptions = {} } = options;
+  return chromium.launchPersistentContext(browserDir ?? cfg.dir.browser, {
+    headless,
+    viewport: { width: cfg.width, height: cfg.height },
+    locale: 'en-US',
+    ...deviceOptions,
+    recordVideo: cfg.record ? { dir: 'data/record/', size: { width: cfg.width, height: cfg.height } } : undefined,
+    recordHar: cfg.record && harPrefix ? { path: `data/record/${harPrefix}-${filenamify(datetime())}.har` } : undefined,
+    handleSIGINT: false,
+    args: ['--hide-crash-restore-bubble', ...extraArgs],
+  });
+};

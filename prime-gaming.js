@@ -1,7 +1,5 @@
-import { chromium } from 'patchright'; // patchright patches Chromium to bypass bot detection
 import { authenticator } from 'otplib';
-import chalk from 'chalk';
-import { resolve, jsonDb, datetime, stealth, filenamify, prompt, confirm, notify, html_game_list, handleSIGINT, clearBrowserLock, writeLastRun, generateFingerprint } from './src/util.js';
+import { resolve, jsonDb, datetime, filenamify, prompt, confirm, notify, html_game_list, handleSIGINT, closeContextSafely, writeLastRun, log, launchBrowser } from './src/util.js';
 import { cfg } from './src/config.js';
 
 const screenshot = (...a) => resolve(cfg.dir.screenshots, 'prime-gaming', ...a);
@@ -10,42 +8,15 @@ const screenshot = (...a) => resolve(cfg.dir.screenshots, 'prime-gaming', ...a);
 const BASE_URL = 'https://luna.amazon.com';
 const URL_CLAIM = `${BASE_URL}/claims/home`;
 
-console.log(datetime(), 'started checking prime-gaming');
+log.section('Prime Gaming');
+log.status('Time', datetime());
 
 const db = await jsonDb('prime-gaming.json', {});
 
-clearBrowserLock(cfg.dir.browser);
-
-const fp = generateFingerprint(cfg.width, cfg.height);
-
 // https://playwright.dev/docs/auth#multi-factor-authentication
-const context = await chromium.launchPersistentContext(cfg.dir.browser, {
-  headless: cfg.headless,
-  viewport: { width: cfg.width, height: cfg.height },
-  userAgent: fp.fingerprint.navigator.userAgent,
-  locale: 'en-US', // ignore OS locale to be sure to have english text for locators
-  recordVideo: cfg.record ? { dir: 'data/record/', size: { width: cfg.width, height: cfg.height } } : undefined,
-  recordHar: cfg.record ? { path: `data/record/pg-${filenamify(datetime())}.har` } : undefined,
-  handleSIGINT: false, // have to handle ourselves and call context.close(), otherwise recordings from above won't be saved
-  args: [
-    '--disable-blink-features=AutomationControlled',
-  ],
-});
+const context = await launchBrowser({ harPrefix: 'pg' });
 
 handleSIGINT(context);
-
-// stealth: sets window.chrome, navigator.plugins, etc. + injects consistent fingerprint
-await stealth(context, fp);
-
-// Inject passkey blocker - Amazon shows passkey prompts during login that interrupt automation
-await context.addInitScript(() => {
-  // Reject passkey creation/login prompts silently
-  const reject = () => Promise.reject(new DOMException('Not allowed', 'NotAllowedError'));
-  Object.defineProperty(navigator, 'credentials', {
-    value: { create: reject, get: reject, store: () => Promise.resolve(), preventSilentAccess: () => Promise.resolve() },
-    writable: false,
-  });
-});
 
 if (!cfg.debug) context.setDefaultTimeout(cfg.timeout);
 
@@ -54,6 +25,7 @@ await page.setViewportSize({ width: cfg.width, height: cfg.height }); // TODO wo
 // console.debug('userAgent:', await page.evaluate(() => navigator.userAgent));
 
 const notify_games = [];
+const notify_pending = []; // separate list — sent in chunks to avoid Pushover body truncation
 let user;
 
 try {
@@ -62,12 +34,13 @@ try {
   await Promise.any(['button:has-text("Sign in")', '[data-a-target="user-dropdown-first-name-text"]'].map(s => page.waitForSelector(s)));
   page.click('[aria-label="Cookies usage disclaimer banner"] button:has-text("Accept Cookies")').catch(_ => { }); // to not waste screen space when non-headless, TODO does not work reliably, need to wait for something else first?
   while (await page.locator('button:has-text("Sign in")').count() > 0) {
-    console.error('Not signed in anymore.');
+    log.warn('Not signed in');
+    if (cfg.nowait) process.exit(1);
     await page.click('button:has-text("Sign in")');
     if (!cfg.debug) context.setDefaultTimeout(cfg.login_timeout); // give user some extra time to log in
-    console.info(`Login timeout is ${cfg.login_timeout / 1000} seconds!`);
-    if (cfg.pg_email && cfg.pg_password) console.info('Using email and password from environment.');
-    else console.info('Press ESC to skip the prompts if you want to login in the browser (not possible in headless mode).');
+    log.status('Login timeout', `${cfg.login_timeout / 1000}s`);
+    if (cfg.pg_email && cfg.pg_password) log.info('Using email and password from environment');
+    else log.info('Press ESC to skip the prompts if you want to login in the browser (not possible in headless mode)');
     const email = cfg.pg_email || await prompt({ message: 'Enter email' });
     const password = email && (cfg.pg_password || await prompt({ type: 'password', message: 'Enter password' }));
     if (email && password) {
@@ -79,25 +52,25 @@ try {
       page.waitForURL('**/ap/signin**').then(async () => { // check for wrong credentials
         const error = await page.locator('.a-alert-content').first().innerText();
         if (!error.trim().length) return;
-        console.error('Login error:', error);
-        await notify(`prime-gaming: login: ${error}`);
-        await context.close(); // finishes potential recording
+        log.fail(`Login error — ${error}`);
+        await notify(`prime-gaming: login: ${error}`, { attachLatestScreenshot: true });
+        await closeContextSafely(context); // finishes potential recording
         process.exit(1);
       });
       // handle MFA, but don't await it
       page.waitForURL('**/ap/mfa**').then(async () => {
-        console.log('Two-Step Verification - enter the One Time Password (OTP), e.g. generated by your Authenticator App');
+        log.info('Two-Step Verification — enter the OTP from your Authenticator App');
         await page.check('[name=rememberDevice]');
         const otp = cfg.pg_otpkey && authenticator.generate(cfg.pg_otpkey) || await prompt({ type: 'text', message: 'Enter two-factor sign in code', validate: n => n.toString().length == 6 || 'The code must be 6 digits!' }); // can't use type: 'number' since it strips away leading zeros and codes sometimes have them
         await page.locator('input[name=otpCode]').pressSequentially(otp.toString());
         await page.click('input[type="submit"]');
       }).catch(_ => { });
     } else {
-      console.log('Waiting for you to login in the browser.');
+      log.info('Waiting for you to login in the browser');
       await notify('prime-gaming: no longer signed in and not enough options set for automatic login.');
       if (cfg.headless) {
-        console.log('Run `SHOW=1 node prime-gaming` to login in the opened browser.');
-        await context.close(); // finishes potential recording
+        log.info('Run `SHOW=1 node prime-gaming` to login in the opened browser');
+        await closeContextSafely(context); // finishes potential recording
         process.exit(1);
       }
     }
@@ -105,23 +78,53 @@ try {
     if (!cfg.debug) context.setDefaultTimeout(cfg.timeout);
   }
   user = await page.locator('[data-a-target="user-dropdown-first-name-text"]').first().innerText();
-  console.log(`Signed in as ${user}`);
+  log.status('User', user);
   // await page.click('button[aria-label="User dropdown and more options"]');
   // const twitch = await page.locator('[data-a-target="TwitchDisplayName"]').first().innerText();
   // console.log(`Twitch user name is ${twitch}`);
   db.data[user] ||= {};
 
   if (await page.getByRole('button', { name: 'Try Prime' }).count()) {
-    console.error('User is currently not an Amazon Prime member, so no games to claim. Exit!');
-    await context.close();
+    log.fail('Not an Amazon Prime member — no games to claim');
+    await closeContextSafely(context);
     process.exit(1);
+  }
+
+  // Surface codes that were claimed on Prime but never confirmed redeemed on the key-store.
+  // Prime won't show these again (code already delivered), so the only way to keep them
+  // visible is to re-include them in every run's notification until status flips to
+  // "redeemed" / "expired" / "invalid". Reconciliation against the actual GOG library
+  // happens in gog.js (it has the authenticated session).
+  const keyStores = new Set(['gog.com', 'microsoft store', 'xbox']);
+  const redeemBaseUrls = {
+    'gog.com': 'https://www.gog.com/redeem',
+    'microsoft store': 'https://account.microsoft.com/billing/redeem',
+    xbox: 'https://account.microsoft.com/billing/redeem',
+  };
+  const terminalRx = /redeemed|expired|invalid/i;
+  const pending = [];
+  for (const [dbTitle, entry] of Object.entries(db.data[user])) {
+    if (!entry || typeof entry !== 'object') continue;
+    if (!entry.code) continue;
+    if (!keyStores.has(entry.store)) continue;
+    if (terminalRx.test(String(entry.status || ''))) continue;
+    pending.push({ dbTitle, entry });
+  }
+  if (pending.length) {
+    log.status('Pending manual redeem', `${pending.length} code(s)`);
+    for (const { dbTitle, entry } of pending) {
+      const base = redeemBaseUrls[entry.store];
+      const redeem_url = entry.store === 'gog.com' ? `${base}/${entry.code}` : base;
+      log.warn(`${dbTitle} — pending manual redeem on ${entry.store}`);
+      notify_pending.push({ title: dbTitle, url: redeem_url });
+    }
   }
 
   const waitUntilStable = async (f, act) => {
     let v;
     while (true) {
       const v2 = await f();
-      console.log('waitUntilStable', v2);
+      if (cfg.debug) console.log('waitUntilStable', v2);
       if (v == v2) break;
       v = v2;
       await act();
@@ -143,174 +146,162 @@ try {
   await games.waitFor();
   // await scrollUntilStable(() => games.locator('.item-card__action').count()); // number of games
   await scrollUntilStable(() => page.evaluate(() => document.querySelector('.tw-full-width').scrollHeight)); // height may change during loading while number of games is still the same?
-  console.log('Number of already claimed games (total):', await games.locator('p:has-text("Collected")').count());
+  const alreadyClaimed = await games.locator('p:has-text("Collected")').count();
+  log.status('Already claimed', alreadyClaimed);
   // can't use .all() since the list of elements via locator will change after click while we iterate over it
-  const internal = await games.locator('.item-card__action:has(button[data-a-target="FGWPOffer"])').elementHandles();
+  const internal = await games.locator('.item-card__action:has(button[data-a-target="FGWPOffer"])').all();
   const external = await games.locator('.item-card__action:has(a[data-a-target="FGWPOffer"])').all();
+  let claimedCount = 0;
+  let needsActionCount = 0;
+  let failedCount = 0;
   // bottom to top: oldest to newest games
   internal.reverse();
   external.reverse();
-  const sameOrNewPage = async url => new Promise(async (resolve, _reject) => {
+  const sameOrNewPage = async url => {
     const isNew = page.url() != url;
     let p = page;
     if (isNew) {
       p = await context.newPage();
       await p.goto(url, { waitUntil: 'domcontentloaded' });
     }
-    resolve([p, isNew]);
-  });
+    return { p, isNew };
+  };
   const skipBasedOnTime = async url => {
     // console.log('  Checking time left for game:', url);
-    const [p, isNew] = await sameOrNewPage(url);
+    const { p, isNew } = await sameOrNewPage(url);
     const dueDateOrg = await p.locator('.availability-date .tw-bold').innerText();
     const dueDate = new Date(Date.parse(dueDateOrg + ' 17:00'));
-    const daysLeft = (dueDate.getTime() - Date.now())/1000/60/60/24;
-    console.log(' ', await p.locator('.availability-date').innerText(), '->', daysLeft.toFixed(2));
+    const daysLeft = (dueDate.getTime() - Date.now()) / 1000 / 60 / 60 / 24;
+    if (cfg.debug) console.log(' ', await p.locator('.availability-date').innerText(), '->', daysLeft.toFixed(2));
     if (isNew) await p.close();
     return daysLeft > cfg.pg_timeLeft;
-  }
-  console.log('\nNumber of free unclaimed games (Prime Gaming):', internal.length);
+  };
+  log.status('Found', `${internal.length} Prime / ${external.length} external`);
   // claim games in internal store
   for (const card of internal) {
     await card.scrollIntoViewIfNeeded();
-    const title = await (await card.$('.item-card-details__body__primary')).innerText();
-    const slug = await (await card.$('a')).getAttribute('href');
+    const title = await (await card.locator('.item-card-details__body__primary')).innerText();
+    const slug = await (await card.locator('a')).getAttribute('href');
     const url = BASE_URL + slug.split('?')[0];
-    console.log('Current free game:', chalk.blue(title));
+    log.game(title, 'Prime Gaming');
     if (cfg.pg_timeLeft && await skipBasedOnTime(url)) continue;
     if (cfg.dryrun) continue;
     if (cfg.interactive && !await confirm()) continue;
-    await (await card.$('.tw-button:has-text("Claim")')).click();
+    await card.locator('.tw-button:has-text("Claim")').click();
     db.data[user][title] ||= { title, time: datetime(), url, store: 'internal' };
+    log.ok(`${title} — claimed!`);
+    claimedCount++;
     notify_games.push({ title, status: 'claimed', url });
-    // const img = await (await card.$('img.tw-image')).getAttribute('src');
+    // const img = await card.locator('img.tw-image').getAttribute('src');
     // console.log('Image:', img);
     await card.screenshot({ path: screenshot('internal', `${filenamify(title)}.png`) });
   }
-  console.log('\nNumber of free unclaimed games (external stores):', external.length);
   // claim games in external/linked stores. Linked: origin.com, epicgames.com; Redeem-key: gog.com, legacygames.com, microsoft
   const external_info = [];
   for (const card of external) { // need to get data incl. URLs in this loop and then navigate in another, otherwise .all() would update after coming back and .elementHandles() like above would lead to error due to page navigation: elementHandle.$: Protocol error (Page.adoptNode)
     const title = await card.locator('.item-card-details__body__primary').innerText();
     const slug = await card.locator('a:has-text("Claim")').first().getAttribute('href');
     const url = BASE_URL + slug.split('?')[0];
-    // await (await card.$('text=Claim')).click(); // goes to URL of game, no need to wait
     external_info.push({ title, url });
   }
-  // external_info = [ { title: 'Fallout 76 (XBOX)', url: 'https://gaming.amazon.com/fallout-76-xbox-fgwp/dp/amzn1.pg.item.9fe17d7b-b6c2-4f58-b494-cc4e79528d0b?ingress=amzn&ref_=SM_Fallout76XBOX_S01_FGWP_CRWN' } ];
   for (const { title, url } of external_info) {
-    console.log('Current free game:', chalk.blue(title)); // , url);
     await page.goto(url, { waitUntil: 'domcontentloaded' });
     if (cfg.debug) await page.pause();
     const item_text = await page.innerText('[data-a-target="DescriptionItemDetails"]');
     const store = item_text.toLowerCase().replace(/.* on /, '').slice(0, -1);
-    console.log('  External store:', store);
+    log.game(title, store);
     if (cfg.pg_timeLeft && await skipBasedOnTime(url)) continue;
     if (cfg.dryrun) continue;
     if (cfg.interactive && !await confirm()) continue;
-    await Promise.any([page.click('[data-a-target="buy-box"] .tw-button:has-text("Get game")'), page.click('[data-a-target="buy-box"] .tw-button:has-text("Claim")'), page.click('.tw-button:has-text("Complete Claim")'), page.waitForSelector('div:has-text("Link game account")'), page.waitForSelector('.thank-you-title:has-text("Success")')]); // waits for navigation
+    await Promise.any([page.click('[data-a-target="buy-box"] .tw-button:has-text("Get game")'), page.click('[data-a-target="buy-box"] .tw-button:has-text("Claim")'), page.click('.tw-button:has-text("Complete Claim")'), page.waitForSelector('[data-a-target="LinkAccountModal"]'), page.waitForSelector('.thank-you-title:has-text("Success")')]); // waits for navigation
+    await page.waitForTimeout(2000);
     db.data[user][title] ||= { title, time: datetime(), url, store };
     const notify_game = { title, url };
     notify_games.push(notify_game); // status is updated below
-    if (await page.locator('div:has-text("Link game account")').count() // TODO still needed? epic games store just has 'Link account' as the button text now.
-       || await page.locator('div:has-text("Link account")').count()) {
-      console.error('  Account linking is required to claim this offer!');
-      notify_game.status = `failed: need account linking for ${store}`;
+    const isSuccess = await page.locator('text=/You collected this|Success/').count() > 0;
+    if (!isSuccess && (await page.locator('[data-a-target="LinkAccountModal"]').count() > 0
+       || await page.locator('[data-a-target="LinkAccountButton"]').count() > 0)) {
+      log.warn(`${title} — account linking required for ${store}`);
+      failedCount++;
+      notify_game.status = `account linking required for ${store}`;
+      notify_game.details = `👉 <a href="https://gaming.amazon.com/settings/connections"><b>Link your ${store} account</b></a>`;
+      await notify(`prime-gaming: ${title} requires account linking for ${store}.\nLink your account: https://gaming.amazon.com/settings/connections`);
       db.data[user][title].status = 'failed: need account linking';
-      // await page.pause();
-      // await page.click('[data-a-target="LinkAccountModal"] [data-a-target="LinkAccountButton"]');
-      // TODO login for epic games also needed if already logged in
-      // wait for https://www.epicgames.com/id/authorize?redirect_uri=https%3A%2F%2Fservice.link.amazon.gg...
-      // await page.click('button[aria-label="Allow"]');
     } else {
       db.data[user][title].status = 'claimed';
-      // print code if there is one
       const redeem = {
-        // 'origin': 'https://www.origin.com/redeem', // TODO still needed or now only via account linking?
         'gog.com': 'https://www.gog.com/redeem',
         'microsoft store': 'https://account.microsoft.com/billing/redeem',
         xbox: 'https://account.microsoft.com/billing/redeem',
         'legacy games': 'https://www.legacygames.com/primedeal',
       };
-      if (store in redeem) { // did not work for linked origin: && !await page.locator('div:has-text("Successfully Claimed")').count()
+      if (store in redeem) {
         const code = await Promise.any([page.inputValue('input[type="text"]'), page.textContent('[data-a-target="ClaimStateClaimCodeContent"]').then(s => s.replace('Your code: ', ''))]); // input: Legacy Games; text: gog.com
-        console.log('  Code to redeem game:', chalk.blue(code));
         if (store == 'legacy games') { // may be different URL like https://legacygames.com/primeday/puzzleoftheyear/
-          redeem[store] = await (await page.$('li:has-text("Click here") a')).getAttribute('href'); // full text: Click here to enter your redemption code.
+          redeem[store] = await page.locator('li:has-text("Click here") a').getAttribute('href'); // full text: Click here to enter your redemption code.
         }
         let redeem_url = redeem[store];
         if (store == 'gog.com') redeem_url += '/' + code; // to log and notify, but can't use for goto below (captcha)
-        console.log('  URL to redeem game:', redeem_url);
         db.data[user][title].code = code;
         let redeem_action = 'redeem';
         if (cfg.pg_redeem) { // try to redeem keys on external stores
-          console.log(`  Trying to redeem ${code} on ${store} (need to be logged in)!`);
           const page2 = await context.newPage();
           await page2.goto(redeem[store], { waitUntil: 'domcontentloaded' });
           if (store == 'gog.com') {
-            // await page.goto(`https://redeem.gog.com/v1/bonusCodes/${code}`); // {"reason":"Invalid or no captcha"}
             await page2.fill('#codeInput', code);
-            // wait for responses before clicking on Continue and then Redeem
-            // first there are requests with OPTIONS and GET to https://redeem.gog.com/v1/bonusCodes/XYZ?language=de-DE
             const r1 = page2.waitForResponse(r => r.request().method() == 'GET' && r.url().startsWith('https://redeem.gog.com/'));
-            await page2.click('[type="submit"]'); // click Continue
-            // console.log(await page2.locator('.warning-message').innerText()); // does not exist if there is no warning
+            await page2.click('[type="submit"]');
             const r1t = await (await r1).text();
-            const reason = JSON.parse(r1t).reason;
-            // {"reason":"Invalid or no captcha"}
-            // {"reason":"code_used"}
-            // {"reason":"code_not_found"}
+            const r1j = JSON.parse(r1t);
+            const reason = r1j.reason;
+            // Responses: {"reason":"Invalid or no captcha"} | {"reason":"code_used"} | {"reason":"code_not_found"}
             if (reason?.includes('captcha')) {
               redeem_action = 'redeem (got captcha)';
-              console.error('  Got captcha; could not redeem!');
+              log.warn(`${title} — captcha on ${store}, redeem manually`);
             } else if (reason == 'code_used') {
               redeem_action = 'already redeemed';
-              console.log('  Code was already used!');
+              log.ok(`${title} — already redeemed on ${store}`);
             } else if (reason == 'code_not_found') {
               redeem_action = 'redeem (not found)';
-              console.error('  Code was not found!');
+              log.warn(`${title} — code not found on ${store}`);
             } else { // TODO not logged in? need valid unused code to test.
-              redeem_action = 'redeemed?';
-              // console.log('  Redeemed successfully? Please report your Responses (if new) in https://github.com/vogler/free-games-claimer/issues/5');
-              console.debug(`  Response 1: ${r1t}`);
-              // then after the click on Redeem there is a POST request which should return {} if claimed successfully
+              if (cfg.debug) console.debug(`  Redeeming ${r1j.products?.[0]?.title}`);
               const r2 = page2.waitForResponse(r => r.request().method() == 'POST' && r.url().startsWith('https://redeem.gog.com/'));
-              await page2.click('[type="submit"]'); // click Redeem
+              await page2.click('[type="submit"]');
               const r2t = await (await r2).text();
-              const reason2 = JSON.parse(r2t).reason;
-              if (r2t == '{}') {
+              const r2j = JSON.parse(r2t);
+              if (r2j?.type == 'async_processing') {
+                await page2.locator('h1:has-text("Code redeemed successfully!")').waitFor();
                 redeem_action = 'redeemed';
-                console.log('  Redeemed successfully.');
                 db.data[user][title].status = 'claimed and redeemed';
-              } else if (reason2?.includes('captcha')) {
+                log.ok(`${title} — claimed and redeemed on ${store}`);
+              } else if (r2j?.reason2?.includes('captcha')) {
                 redeem_action = 'redeem (got captcha)';
-                console.error('  Got captcha; could not redeem!');
+                log.warn(`${title} — captcha on ${store}, redeem manually`);
               } else {
-                console.debug(`  Response 2: ${r2t}`);
-                console.log('  Unknown Response 2 - please report in https://github.com/vogler/free-games-claimer/issues/5');
+                if (cfg.debug) console.debug(`  Response 1: ${r1t}`);
+                if (cfg.debug) console.debug(`  Response 2: ${r2t}`);
+                redeem_action = 'unknown';
+                log.warn(`${title} — unknown redeem response on ${store} (please report: issues/5)`);
               }
             }
           } else if (store == 'microsoft store' || store == 'xbox') {
-            console.error(`  Redeem on ${store} is experimental!`);
-            // await page2.pause();
             if (page2.url().startsWith('https://login.')) {
-              console.error('  Not logged in! Please redeem the code above manually. You can now login in the browser for next time. Waiting for 60s.');
-              await page2.waitForTimeout(60 * 1000);
               redeem_action = 'redeem (login)';
+              log.warn(`${title} — login required on ${store}, redeem manually`);
+              await page2.waitForTimeout(60 * 1000); // give user chance to log in
             } else {
               const iframe = page2.frameLocator('#redeem-iframe');
               const input = iframe.locator('[name=tokenString]');
               await input.waitFor();
               await input.fill(code);
               const r = page2.waitForResponse(r => r.url().startsWith('https://cart.production.store-web.dynamics.com/v1.0/Redeem/PrepareRedeem'));
-              // console.log(await page2.locator('.redeem_code_error').innerText());
               const rt = await (await r).text();
-              // {"code":"NotFound","data":[],"details":[],"innererror":{"code":"TokenNotFound",...
               const j = JSON.parse(rt);
               const reason = j?.events?.cart.length && j.events.cart[0]?.data?.reason;
               if (reason == 'TokenNotFound') {
                 redeem_action = 'redeem (not found)';
-                console.error('  Code was not found!');
+                log.warn(`${title} — code not found on ${store}`);
               } else if (j?.productInfos?.length && j.productInfos[0]?.redeemable) {
                 await iframe.locator('button:has-text("Next")').click();
                 await iframe.locator('button:has-text("Confirm")').click();
@@ -318,52 +309,65 @@ try {
                 const j = JSON.parse(await (await r).text());
                 if (j?.events?.cart.length && j.events.cart[0]?.data?.reason == 'UserAlreadyOwnsContent') {
                   redeem_action = 'already redeemed';
-                  console.error('  error: UserAlreadyOwnsContent');
-                } else if (true) { // TODO what's returned on success?
+                  log.ok(`${title} — already owned on ${store}`);
+                } else {
                   redeem_action = 'redeemed';
                   db.data[user][title].status = 'claimed and redeemed?';
-                  console.log('  Redeemed successfully? Please report if not in https://github.com/vogler/free-games-claimer/issues/5');
+                  log.ok(`${title} — claimed and redeemed on ${store} (unconfirmed)`);
                 }
-              } else { // TODO find out other responses
+              } else {
                 redeem_action = 'unknown';
-                console.debug(`  Response: ${rt}`);
-                console.log('  Redeemed successfully? Please report your Response from above (if it is new) in https://github.com/vogler/free-games-claimer/issues/5');
+                if (cfg.debug) console.debug(`  Response: ${rt}`);
+                log.warn(`${title} — unknown redeem response on ${store} (please report: issues/5)`);
               }
             }
           } else if (store == 'legacy games') {
-            // await page2.pause();
             await page2.fill('[name=coupon_code]', code);
             await page2.fill('[name=email]', cfg.lg_email);
             await page2.fill('[name=email_validate]', cfg.lg_email);
             await page2.uncheck('[name=newsletter_sub]');
             await page2.click('[type="submit"]');
             try {
-              // await page2.waitForResponse(r => r.url().startsWith('https://promo.legacygames.com/promotion-processing/order-management.php')); // status code 302
               await page2.waitForSelector('h2:has-text("Thanks for redeeming")');
               redeem_action = 'redeemed';
               db.data[user][title].status = 'claimed and redeemed';
+              log.ok(`${title} — claimed and redeemed on ${store}`);
             } catch (error) {
-              console.error('  Got error', error);
+              log.fail(`${title} — redeem error on ${store}: ${error.message || error}`);
+              if (cfg.debug) console.error(error);
               redeem_action = 'redeemed?';
               db.data[user][title].status = 'claimed and redeemed?';
-              console.log('  Redeemed successfully? Please report problems in https://github.com/vogler/free-games-claimer/issues/5');
             }
           } else {
-            console.error(`  Redeem on ${store} not yet implemented!`);
+            log.warn(`${title} — redeem on ${store} not yet implemented`);
           }
           if (cfg.debug) await page2.pause();
           await page2.close();
+        } else {
+          log.ok(`${title} — claimed on ${store} (manual redeem)`);
         }
-        notify_game.status = `<a href="${redeem_url}">${redeem_action}</a> ${code} on ${store}`;
+        // Tally & notification
+        const needsManual = ['redeem', 'redeem (got captcha)', 'redeem (not found)', 'redeem (login)', 'unknown'].includes(redeem_action);
+        if (redeem_action == 'redeemed' || redeem_action == 'redeemed?' || redeem_action == 'already redeemed') claimedCount++;
+        else if (needsManual) needsActionCount++;
+        // Pushover strips HTML tags, so <a> anchors don't survive. We avoid the bare
+        // "gog.com" token (iOS would auto-linkify it to the homepage) by using "GOG"
+        // and putting the full redeem URL as plain text so auto-linkify grabs the
+        // tappable full URL instead.
+        const storeLabel = store === 'gog.com' ? 'GOG' : store;
+        notify_game.status = `${redeem_action} on ${storeLabel}`;
+        if (needsManual) {
+          notify_game.url = redeem_url;
+          notify_game.details = `${redeem_url} (code: ${code})`;
+        }
       } else {
+        log.ok(`${title} — claimed on ${store}`);
+        claimedCount++;
         notify_game.status = `claimed on ${store}`;
         db.data[user][title].status = 'claimed';
       }
-      // save screenshot of potential code just in case
       await page.screenshot({ path: screenshot('external', `${filenamify(title)}.png`), fullPage: true });
-      // console.info('  Saved a screenshot of page to', p);
     }
-    // await page.pause();
   }
   await page.goto(URL_CLAIM, { waitUntil: 'domcontentloaded' });
   await page.click('button[data-type="Game"]');
@@ -379,18 +383,29 @@ try {
 
   // https://github.com/vogler/free-games-claimer/issues/55
   if (cfg.pg_claimdlc) {
-    console.log('Trying to claim in-game content...');
-    await page.click('button[data-type="InGameLoot"]');
+    log.info('Checking in-game content (DLC)');
+    // Amazon removed the in-game content tab from the Prime Gaming claims
+    // page some time in 2026 — the page now serves only a "Claim Games"
+    // list with no InGameLoot data-type anywhere in the markup. Probe for
+    // the tab briefly and skip cleanly instead of blocking on a 60s
+    // timeout. If Amazon brings the section back the existing flow
+    // downstream still works.
+    const lootTab = page.locator('button[data-type="InGameLoot"]');
+    if (await lootTab.count() === 0) {
+      log.warn('In-game content tab not present on the current Prime Gaming page — Amazon appears to have removed this section. Skipping.');
+      // fall through to the summary at the bottom of this block
+    } else {
+    await lootTab.click();
     const loot = page.locator('div[data-a-target="offer-list-IN_GAME_LOOT"]');
     await loot.waitFor();
 
-    process.stdout.write('Loading all DLCs on page...');
-    await scrollUntilStable(() => loot.locator('[data-a-target="item-card"]').count())
+    log.status('DLC', 'loading all on page...');
+    await scrollUntilStable(() => loot.locator('[data-a-target="item-card"]').count());
 
-    console.log('\nNumber of already claimed DLC:', await loot.locator('p:has-text("Collected")').count());
+    log.status('DLC already claimed', await loot.locator('p:has-text("Collected")').count());
 
     const cards = await loot.locator('[data-a-target="item-card"]:has(p:text-is("Claim"))').all();
-    console.log('Number of unclaimed DLC:', cards.length);
+    log.status('DLC unclaimed', cards.length);
     const dlcs = await Promise.all(cards.map(async card => ({
       game: await card.locator('.item-card-details__body p').innerText(),
       title: await card.locator('.item-card-details__body__primary').innerText(),
@@ -402,7 +417,7 @@ try {
     for (const dlc of dlcs) {
       const title = `${dlc.game} - ${dlc.title}`;
       const url = dlc.url;
-      console.log('Current DLC:', title);
+      log.game(title, 'DLC');
       if (cfg.debug) await page.pause();
       if (cfg.dryrun) continue;
       if (cfg.interactive && !await confirm()) continue;
@@ -419,45 +434,79 @@ try {
         let unlinked_store;
         if (await linkAccountButton.count()) {
           unlinked_store = await linkAccountButton.first().getAttribute('aria-label');
-          console.debug('  LinkAccountButton label:', unlinked_store);
+          if (cfg.debug) console.debug('  LinkAccountButton label:', unlinked_store);
           const match = unlinked_store.match(/Link (.*) account/);
           if (match && match.length == 2) unlinked_store = match[1];
         } else if (await page.locator('text=Link game account').count()) { // epic-games only?
-          console.error('  Missing account linking (epic-games specific button?):', await page.locator('button[data-a-target="gms-cta"]').innerText()); // TODO needed?
+          if (cfg.debug) console.error('  Missing account linking (epic-games specific button?):', await page.locator('button[data-a-target="gms-cta"]').innerText()); // TODO needed?
           unlinked_store = 'epic-games';
         }
         if (unlinked_store) {
-          console.error('  Missing account linking:', unlinked_store, url);
+          log.warn(`${title} — account linking required for ${unlinked_store}`);
           dlc_unlinked[unlinked_store] ??= [];
           dlc_unlinked[unlinked_store].push(title);
+          failedCount++;
         } else {
           const code = await page.inputValue('input[type="text"]').catch(_ => undefined);
-          console.log('  Code to redeem game:', chalk.blue(code));
+          log.ok(`${title} — claimed (DLC)`);
           db.data[user][title].code = code;
           db.data[user][title].status = 'claimed';
-          // notify_game.status = `<a href="${redeem[store]}">${redeem_action}</a> ${code} on ${store}`;
+          claimedCount++;
         }
-        // await page.pause();
       } catch (error) {
-        console.error(error);
+        log.fail(`${title} — DLC error: ${error.message || error}`);
+        if (cfg.debug) console.error(error);
+        failedCount++;
       } finally {
         await page.goto(URL_CLAIM, { waitUntil: 'domcontentloaded' });
         await page.click('button[data-type="InGameLoot"]');
       }
     }
-    console.log('DLC: Unlinked accounts:', dlc_unlinked);
+    if (Object.keys(dlc_unlinked).length) {
+      log.warn(`DLC — unlinked accounts: ${Object.entries(dlc_unlinked).map(([k, v]) => `${k} (${v.length})`).join(', ')}`);
+    }
+    } // end of "lootTab exists" branch
   }
+  const summaryParts = [];
+  if (claimedCount) summaryParts.push(`${claimedCount} claimed`);
+  if (needsActionCount) summaryParts.push(`${needsActionCount} needs manual redeem`);
+  if (failedCount) summaryParts.push(`${failedCount} failed`);
+  if (summaryParts.length) log.summary(summaryParts);
 } catch (error) {
   process.exitCode ||= 1;
-  console.error('--- Exception:');
-  console.error(error); // .toString()?
-  if (error.message && process.exitCode != 130) notify(`prime-gaming failed: ${error.message.split('\n')[0]}`);
+  log.fail(`Exception: ${error.message || error}`);
+  if (cfg.debug) console.error(error);
+  if (error.message && process.exitCode != 130) await notify(`prime-gaming failed: ${error.message.split('\n')[0]}`, { attachLatestScreenshot: true });
 } finally {
-  await db.write(); // write out json db
+  await db.write();
+  log.sectionEnd();
   writeLastRun('prime-gaming');
-  if (notify_games.length) { // list should only include claimed games
-    notify(`prime-gaming (${user}):<br>${html_game_list(notify_games)}`);
+  if (notify_games.length) {
+    await notify(`prime-gaming (${user}):<br>${html_game_list(notify_games)}`);
+  }
+  // Pending redeems sent as their own notifications, chunked to stay under Pushover's
+  // ~1024-char body limit. Plain-text format with bare redeem URLs — Pushover strips
+  // any <a> tags, so the URL must be literal text for the mobile OS to auto-linkify it.
+  // When PUBLIC_URL is set (panel reachable from mobile), the first chunk also
+  // includes a ?batch=gog deep-link so the user can run all codes through the
+  // panel's batch-redeem flow with a single tap instead of per-code.
+  if (notify_pending.length) {
+    const panelUrl = (process.env.PUBLIC_URL || '').replace(/\/+$/, '');
+    const batchLink = panelUrl ? `Batch redeem all: ${panelUrl}/?batch=gog` : null;
+    const chunkSize = 10;
+    const total = notify_pending.length;
+    const chunks = [];
+    for (let i = 0; i < total; i += chunkSize) chunks.push(notify_pending.slice(i, i + chunkSize));
+    for (let i = 0; i < chunks.length; i++) {
+      const partLabel = chunks.length > 1 ? ` (${i + 1}/${chunks.length})` : '';
+      const header = `prime-gaming (${user}) — ${total} pending redeem${total === 1 ? '' : 's'}${partLabel}:`;
+      const lines = chunks[i].map(g => `- ${g.title} → ${g.url}`);
+      const parts = [header];
+      if (i === 0 && batchLink) parts.push(batchLink);
+      parts.push(lines.join('<br>'));
+      await notify(parts.join('<br>'));
+    }
   }
 }
-if (page.video()) console.log('Recorded video:', await page.video().path());
-await context.close();
+if (page.video()) log.info(`Recorded video — ${await page.video().path()}`);
+await closeContextSafely(context);
