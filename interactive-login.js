@@ -5,10 +5,13 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 const __panelDirname = path.dirname(fileURLToPath(import.meta.url));
 import { chromium, devices } from 'patchright';
-import { datetime, notify, jsonDb, normalizeTitle } from './src/util.js';
+import { datetime, notify, jsonDb, normalizeTitle, dataDir } from './src/util.js';
 import { readLibrary } from './src/panel/library.js';
+import { makeCBHelpers } from './src/panel/circuit-breaker.js';
 import { cfg } from './src/config.js';
 import { describeConfig, patchConfig, describeEnv, getSchedulerConfig, CONFIG_FILE_PATH } from './src/app-config.js';
+
+const cb = makeCBHelpers(dataDir('circuit-breaker.json'));
 
 const PANEL_PORT = Number(process.env.PANEL_PORT) || 7080;
 const NOVNC_PORT = process.env.NOVNC_PORT || 6080;
@@ -509,13 +512,20 @@ function activeServices() {
 // If nothing matches, returns null so the caller can report it.
 function buildClaimCommand({ manual = false, sites = null } = {}) {
   const targetSet = sites ? new Set(sites) : activeServices();
+  const cbState = !sites ? cb.readState() : {}; // skip CB check for explicit single-service runs
   const parts = [];
   for (const entry of CLAIM_SCRIPT_ORDER) {
     if (!sites && manual && entry.id === 'microsoft') continue;
-    // microsoft.js covers both desktop + mobile — invoke once if either ID
-    // is in the target set.
+    // microsoft.js covers both desktop + mobile — invoke once if either ID is in the target set.
     const ids = [entry.id].concat(entry.linkedWith ? [entry.linkedWith] : []);
-    if (ids.some(id => targetSet.has(id))) parts.push('node ' + entry.script);
+    if (!ids.some(id => targetSet.has(id))) continue;
+    // Skip services with an open circuit breaker (scheduled runs only, not explicit sites)
+    if (!sites && cb.isOpen(entry.id, cbState)) {
+      const until = new Date(cb.openUntil(entry.id, cbState)).toLocaleString();
+      console.log(`[${datetime()}] Circuit breaker OPEN for ${entry.id} — skipping until ${until}`);
+      continue;
+    }
+    parts.push(`node ${entry.script}; echo "SVCRESULT:${entry.id}:$?"`);
   }
   return parts.length ? parts.join('; ') : null;
 }
@@ -852,10 +862,16 @@ function runAllScripts({ source = 'panel', sites = null } = {}) {
 
   runProcess = child;
 
+  const svcResults = {}; // id → exit code, filled by SVCRESULT: markers in stdout
+
   runDone = new Promise(resolve => {
     child.stdout.on('data', data => {
       process.stdout.write(data); // keep `docker logs` useful
       const text = data.toString();
+      // Per-service exit code markers injected by buildClaimCommand
+      for (const m of text.matchAll(/SVCRESULT:(\S+?):(\d+)/g)) {
+        svcResults[m[1]] = parseInt(m[2]);
+      }
       // Captcha markers from src/util.js#awaitUserCaptchaSolve. Parsed here
       // (not in the per-line forEach below) so multi-line buffers still match.
       const startMatch = text.match(/\[CAPTCHA-START\] service=(\S+)\s+label=(.*?)(?:\r?\n|$)/);
@@ -883,6 +899,22 @@ function runAllScripts({ source = 'panel', sites = null } = {}) {
     });
 
     child.on('close', code => {
+      // Update circuit breaker per service based on exit codes captured from stdout
+      for (const [svcId, exitCode] of Object.entries(svcResults)) {
+        const s = cb.readState();
+        if (exitCode === 0) {
+          const wasOpen = !!s[svcId]?.openUntil;
+          cb.recordSuccess(svcId, s);
+          if (wasOpen) notify(`${svcId}: circuit breaker closed — service recovered`).catch(() => {});
+        } else {
+          const wasClosed = !s[svcId]?.openUntil;
+          cb.recordFailure(svcId, s, cfg.circuit_breaker_threshold, cfg.circuit_breaker_cooldown_hours);
+          const s2 = cb.readState();
+          if (wasClosed && s2[svcId]?.openUntil) {
+            notify(`Circuit breaker opened for ${svcId} after ${s2[svcId].failures} failures — skipping for ${cfg.circuit_breaker_cooldown_hours}h`).catch(() => {});
+          }
+        }
+      }
       runStatus = code === 0 ? 'success' : 'finished';
       runLog.push({ type: 'system', text: `Scripts finished with exit code ${code}`, time: datetime() });
       lastRun = {
