@@ -230,13 +230,17 @@ const findLatestScreenshot = async () => {
 };
 
 // Direct Telegram notification without Apprise (set TG_TOKEN and TG_CHAT_ID env vars).
-export const notifyTelegram = async (html) => {
+export const notifyTelegram = async (html, opts = {}) => {
   if (!cfg.tg_token || !cfg.tg_chat_id) return;
   try {
-    const res = await fetch(`https://api.telegram.org/bot${cfg.tg_token}/sendMessage`, {
+    const endpoint = opts.imageUrl ? 'sendPhoto' : 'sendMessage';
+    const body = opts.imageUrl
+      ? { chat_id: cfg.tg_chat_id, photo: opts.imageUrl, caption: html.slice(0, 1024), parse_mode: 'HTML' }
+      : { chat_id: cfg.tg_chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: true };
+    const res = await fetch(`https://api.telegram.org/bot${cfg.tg_token}/${endpoint}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ chat_id: cfg.tg_chat_id, text: html, parse_mode: 'HTML', disable_web_page_preview: true }),
+      body: JSON.stringify(body),
     });
     if (!res.ok) console.error('Telegram notification error:', await res.text());
   } catch (e) {
@@ -244,8 +248,33 @@ export const notifyTelegram = async (html) => {
   }
 };
 
+export const notifyDiscord = async (games, fallbackText) => {
+  if (!cfg.discord_webhook) return;
+  try {
+    const relevant = (games || []).filter(g => g.status === 'claimed' || g.status === 'failed').slice(0, 10);
+    const embeds = relevant.map(g => ({
+      title: g.title,
+      url: g.url || undefined,
+      color: g.status === 'claimed' ? 0x57F287 : 0xED4245,
+      thumbnail: g.imageUrl ? { url: g.imageUrl } : undefined,
+      footer: { text: g.status },
+    }));
+    const payload = embeds.length ? { embeds } : { content: fallbackText };
+    const res = await fetch(cfg.discord_webhook, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    if (!res.ok) console.error('Discord notification error:', await res.text());
+  } catch (e) {
+    console.error('Discord notification failed:', e.message);
+  }
+};
+
 export const notify = (html, opts = {}) => {
-  notifyTelegram(html).catch(() => {}); // fire-and-forget — runs in parallel with Apprise
+  const tgImage = opts.games?.length === 1 ? opts.games[0].imageUrl : undefined;
+  notifyTelegram(html, { imageUrl: tgImage }).catch(() => {});
+  notifyDiscord(opts.games || [], html).catch(() => {});
   if (!cfg.notify) {
     if (cfg.debug) console.debug('notify: NOTIFY is not set!');
     return Promise.resolve();
@@ -350,6 +379,19 @@ export const awaitUserCaptchaSolve = async (page, {
 // separators/punctuation/whitespace. Used to reconcile Prime Gaming entries
 // against the authenticated GOG library where exact punctuation / edition
 // suffixes may differ between stores.
+export const parsePrice = (text) => {
+  if (!text) return null;
+  const cleaned = text.replace(/[^0-9.,]/g, '').trim();
+  if (!cleaned) return null;
+  const lastComma = cleaned.lastIndexOf(',');
+  const lastDot   = cleaned.lastIndexOf('.');
+  const normalized = lastComma > lastDot
+    ? cleaned.replace(/\./g, '').replace(',', '.')
+    : cleaned.replace(/,/g, '');
+  const val = parseFloat(normalized);
+  return isNaN(val) ? null : val;
+};
+
 export const normalizeTitle = s => (s || '')
   .toLowerCase()
   .replace(/[:;\-–—_/\\]/g, ' ')

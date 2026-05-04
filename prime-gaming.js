@@ -482,7 +482,7 @@ try {
   log.sectionEnd();
   writeLastRun('prime-gaming');
   if (notify_games.length) {
-    await notify(`prime-gaming (${user}):<br>${html_game_list(notify_games)}`);
+    await notify(`prime-gaming (${user}):<br>${html_game_list(notify_games)}`, { games: notify_games });
   }
   // Pending redeems sent as their own notifications, chunked to stay under Pushover's
   // ~1024-char body limit. Plain-text format with bare redeem URLs — Pushover strips

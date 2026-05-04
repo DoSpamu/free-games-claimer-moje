@@ -148,6 +148,7 @@ try {
     const url = await banner.locator('a').first().getAttribute('href');
     log.game(title, url);
     db.data[user][title] ||= { title, time: datetime(), url };
+    const _gogImageUrl = await fetch(url).then(r => r.text()).then(html => { const m = html.match(/<meta property="og:image" content="([^"]+)"/); return m ? m[1] : null; }).catch(() => null);
     if (cfg.dryrun) process.exit(1);
     if (cfg.interactive && !await confirm()) process.exit(0);
     await banner.screenshot({ path: screenshot(`${filenamify(title)}.png`) });
@@ -169,7 +170,7 @@ try {
       }
     }
     db.data[user][title].status ||= status;
-    const notify_entry = { title, url, status };
+    const notify_entry = { title, url, status, imageUrl: _gogImageUrl || null };
     if (status !== 'claimed' && status !== 'existed') {
       notify_entry.details = `Game: ${url}`;
     }
@@ -371,7 +372,7 @@ try {
   writeLastRun('gog');
   log.sectionEnd();
   if (notify_games.filter(g => g.status != 'existed').length) {
-    await notify(`gog (${user}):<br>${html_game_list(notify_games)}`);
+    await notify(`gog (${user}):<br>${html_game_list(notify_games)}`, { games: notify_games });
   }
 }
 if (page.video()) log.info(`Recorded video — ${await page.video().path()}`);

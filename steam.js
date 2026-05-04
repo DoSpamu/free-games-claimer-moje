@@ -1,6 +1,6 @@
 import { writeFileSync } from 'node:fs';
 import { authenticator } from 'otplib';
-import { resolve, jsonDb, datetime, filenamify, prompt, notify, html_game_list, handleSIGINT, clearBrowserLock, closeContextSafely, writeLastRun, log, dataDir, launchBrowser } from './src/util.js';
+import { resolve, jsonDb, datetime, filenamify, prompt, notify, html_game_list, handleSIGINT, clearBrowserLock, closeContextSafely, writeLastRun, log, dataDir, launchBrowser, parsePrice } from './src/util.js';
 import { cfg } from './src/config.js';
 
 const screenshot = (...a) => resolve(cfg.dir.screenshots, 'steam', ...a);
@@ -20,21 +20,6 @@ const RATING_MAP = {
   'overwhelmingly negative': 1,
 };
 
-function parsePrice(text) {
-  if (!text) return null;
-  const cleaned = text.replace(/[^0-9.,]/g, '').trim();
-  if (!cleaned) return null;
-  const lastComma = cleaned.lastIndexOf(',');
-  const lastDot = cleaned.lastIndexOf('.');
-  let normalized;
-  if (lastComma > lastDot) {
-    normalized = cleaned.replace(/\./g, '').replace(',', '.');
-  } else {
-    normalized = cleaned.replace(/,/g, '');
-  }
-  const val = parseFloat(normalized);
-  return isNaN(val) ? null : val;
-}
 
 log.section('Steam');
 log.status('Time', datetime());
@@ -411,7 +396,7 @@ try {
         log.ok(`${title} — claimed!`);
         db.data[user][appId].status = 'claimed';
         db.data[user][appId].time = datetime();
-        notify_games.push({ title, url: game.url, status: 'claimed' });
+        notify_games.push({ title, url: game.url, status: 'claimed', imageUrl: `https://cdn.cloudflare.steamstatic.com/steam/apps/${appId}/header.jpg` });
         claimed++;
       } else {
         log.fail(`${title} — could not verify claim`);
@@ -441,7 +426,7 @@ try {
   log.sectionEnd();
   writeLastRun('steam');
   if (notify_games.filter(g => g.status === 'claimed' || g.status === 'failed').length) {
-    await notify(`steam (${user || 'unknown'}):<br>${html_game_list(notify_games)}`);
+    await notify(`steam (${user || 'unknown'}):<br>${html_game_list(notify_games)}`, { games: notify_games });
   }
 }
 if (page.video()) log.info(`Recorded video — ${await page.video().path()}`);

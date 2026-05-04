@@ -24,7 +24,10 @@ try {
     const isFree = promos.some(o => o.discountSetting?.discountPercentage === 0);
     if (!isFree) continue;
     const slug = el.catalogNs?.mappings?.[0]?.pageSlug || el.urlSlug;
-    if (slug) offerIdMap[decodeURIComponent(slug).toLowerCase()] = el.id;
+    if (slug) offerIdMap[decodeURIComponent(slug).toLowerCase()] = {
+      id: el.id,
+      imageUrl: el.keyImages?.find(img => img.type === 'DieselGameBox' || img.type === 'Thumbnail')?.url || null,
+    };
   }
   if (Object.keys(offerIdMap).length) {
     log.status('Offer IDs fetched', Object.keys(offerIdMap).length);
@@ -222,7 +225,8 @@ try {
     const existedInDb = db.data[user][game_id];
     db.data[user][game_id] ||= { title, time: datetime(), url: page.url() };
     if (bundle_includes) log.info(`${title} includes: ${bundle_includes.join(', ')}`);
-    const notify_game = { title, url, status: 'failed' };
+    const _slug = (() => { try { return decodeURIComponent(new URL(url).pathname.replace(/\/+$/, '').split('/').pop()).toLowerCase(); } catch { return url.split('/').pop().toLowerCase(); } })();
+    const notify_game = { title, url, status: 'failed', imageUrl: offerIdMap[_slug]?.imageUrl || null };
     notify_games.push(notify_game);
 
     if (btnText == 'in library') {
@@ -409,7 +413,7 @@ try {
     const slugFromUrl = url => {
       try { return decodeURIComponent(new URL(url).pathname.replace(/\/+$/, '').split('/').pop()).toLowerCase(); } catch { return url.split('/').pop().toLowerCase(); }
     };
-    const failedOfferIds = [...new Set(failedGames.map(g => offerIdMap[slugFromUrl(g.url)]).filter(Boolean))];
+    const failedOfferIds = [...new Set(failedGames.map(g => offerIdMap[slugFromUrl(g.url)]?.id).filter(Boolean))];
     if (cfg.debug) {
       const unmatched = failedGames.filter(g => !offerIdMap[slugFromUrl(g.url)]);
       if (unmatched.length) console.debug('  Cart fallback — unmatched slugs:', unmatched.map(g => slugFromUrl(g.url)));
@@ -419,7 +423,7 @@ try {
       const cartUrl = `https://store.epicgames.com/en-US/cart?${failedOfferIds.map(id => `offerId=${id}`).join('&')}`;
       log.info(`Cart link — ${cartUrl}`);
       for (const g of failedGames) {
-        const offerId = offerIdMap[slugFromUrl(g.url)];
+        const offerId = offerIdMap[slugFromUrl(g.url)]?.id;
         if (offerId) {
           const singleCartUrl = `https://store.epicgames.com/en-US/cart?offerId=${offerId}`;
           g.details = (g.details ? g.details + ' · ' : '') + `<a href="${singleCartUrl}">Claim in cart</a>`;
@@ -441,7 +445,7 @@ try {
   writeLastRun('epic-games');
   log.sectionEnd();
   if (notify_games.filter(g => g.status == 'claimed' || g.status == 'failed' || g.status == 'action').length) {
-    await notify(`epic-games (${user}):<br>${html_game_list(notify_games)}`);
+    await notify(`epic-games (${user}):<br>${html_game_list(notify_games)}`, { games: notify_games });
   }
 }
 if (cfg.debug) writeFileSync(path.resolve(cfg.dir.browser, 'cookies.json'), JSON.stringify(await context.cookies()));
