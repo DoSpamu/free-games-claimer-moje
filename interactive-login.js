@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { watch, readFileSync, existsSync } from 'node:fs';
+import { watch, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 const __panelDirname = path.dirname(fileURLToPath(import.meta.url));
@@ -17,6 +17,44 @@ const _sessionCache = new Map(); // siteId → { result: {loggedIn, user}, expir
 const SESSION_TTL_MS = { loggedIn: 30 * 60 * 1000, loggedOut: 5 * 60 * 1000 };
 
 function invalidateSession(siteId) { _sessionCache.delete(siteId); }
+
+const ACCOUNTS_FILE = dataDir('accounts.json');
+
+function readAccounts() {
+  try {
+    if (!existsSync(ACCOUNTS_FILE)) return [];
+    return JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf8')) || [];
+  } catch { return []; }
+}
+
+function writeAccounts(accounts) {
+  mkdirSync(path.dirname(ACCOUNTS_FILE), { recursive: true });
+  const tmp = ACCOUNTS_FILE + '.' + process.pid + '.tmp';
+  writeFileSync(tmp, JSON.stringify(accounts, null, 2) + '\n');
+  renameSync(tmp, ACCOUNTS_FILE);
+}
+
+const CRED_PATTERN = /password|otpkey|token|secret|key$/i;
+
+function maskAccountCredentials(account) {
+  const masked = { ...account, env: { ...account.env } };
+  for (const k of Object.keys(masked.env || {})) {
+    if (CRED_PATTERN.test(k)) {
+      const v = masked.env[k];
+      if (typeof v === 'string' && v.length > 4) masked.env[k] = '••••' + v.slice(-4);
+    }
+  }
+  return masked;
+}
+
+function getEffectiveAccounts() {
+  const configured = readAccounts();
+  const hasEnvCred = process.env.EMAIL || process.env.EG_EMAIL || process.env.GOG_EMAIL || process.env.STEAM_EMAIL;
+  const envAccount = hasEnvCred
+    ? [{ id: '_env', label: 'Default (env vars)', browserDir: null, services: [], env: {} }]
+    : [];
+  return [...envAccount, ...configured];
+}
 
 const PANEL_PORT = Number(process.env.PANEL_PORT) || 7080;
 const NOVNC_PORT = process.env.NOVNC_PORT || 6080;
@@ -827,7 +865,7 @@ async function checkAllSites() {
   return results;
 }
 
-function runAllScripts({ source = 'panel', sites = null } = {}) {
+function runAllScripts({ source = 'panel', sites = null, extraEnv = {} } = {}) {
   const busy = browserBusy();
   if (busy) return { success: false, error: `Cannot start run — ${busy}.` };
 
@@ -842,8 +880,8 @@ function runAllScripts({ source = 'panel', sites = null } = {}) {
   // instead of waiting for interactive login. We follow up with a session
   // re-check to notify the user about any sites that now need manual action.
   const childEnv = source === 'scheduler'
-    ? { ...process.env, NOWAIT: '1' }
-    : { ...process.env };
+    ? { ...process.env, NOWAIT: '1', ...extraEnv }
+    : { ...process.env, ...extraEnv };
   // Single-service / explicit Run bypasses the MS internal window so a test
   // click at 3 PM doesn't sleep 17 hours until the 8 AM window opens.
   // Can't just set MS_SCHEDULE_HOURS=0 here — the in-app config layer
@@ -1091,12 +1129,18 @@ async function schedulerLoop() {
       console.log(`[${datetime()}] Scheduler: skipping run — ${busy}.`);
       continue;
     }
-    const res = runAllScripts({ source: 'scheduler' });
-    if (res.success && runDone) {
-      try { await runDone; } catch (e) { console.error(`[${datetime()}] Scheduler run error:`, e); }
-    } else if (!res.success) {
-      console.log(`[${datetime()}] Scheduler: ${res.error}`);
-      continue;
+    const accounts = getEffectiveAccounts();
+    for (const account of accounts) {
+      if (accounts.length > 1) console.log(`[${datetime()}] Scheduler: running account "${account.label}" (${account.id})...`);
+      const extraEnv = { ...account.env };
+      if (account.browserDir) extraEnv.BROWSER_DIR = account.browserDir;
+      const accountSites = account.services?.length ? account.services : null;
+      const res = runAllScripts({ source: 'scheduler', sites: accountSites, extraEnv });
+      if (res.success && runDone) {
+        try { await runDone; } catch (e) { console.error(`[${datetime()}] Scheduler run error:`, e); }
+      } else if (!res.success) {
+        console.log(`[${datetime()}] Scheduler: ${res.error}`);
+      }
     }
     // Run finished — check which sessions survived and notify about stale ones.
     try { await postRunSessionCheck(); } catch (e) { console.error(`[${datetime()}] Session check failed:`, e); }
@@ -1421,6 +1465,7 @@ const PANEL_HTML = `<!DOCTYPE html>
   body[data-tab="settings"] .tab-panel[data-panel="settings"] { display: flex; flex: 1; flex-direction: column; position: relative; }
   body[data-tab="environment"] .tab-panel[data-panel="environment"] { display: flex; flex: 1; flex-direction: column; }
   body[data-tab="library"] .tab-panel[data-panel="library"] { display: block; }
+  body[data-tab="accounts"] .tab-panel[data-panel="accounts"] { display: block; overflow-y: auto; padding: 24px 32px; }
 
   .settings-layout { flex: 1; display: grid; grid-template-columns: 180px 1fr; min-height: 0; }
   .settings-rail { background: #12213a; border-right: 1px solid #233454; padding: 14px 0; overflow-y: auto; display: flex; flex-direction: column; }
@@ -1789,6 +1834,7 @@ const PANEL_HTML = `<!DOCTYPE html>
       <button class="tab" data-tab="settings" onclick="switchTab('settings')">Settings</button>
       <button class="tab" data-tab="environment" onclick="switchTab('environment')">Environment</button>
       <button class="tab" data-tab="library" onclick="switchTab('library')">Library</button>
+      <button class="tab" data-tab="accounts" onclick="switchTab('accounts')">Accounts</button>
     </nav>
     <div class="header-actions">
       <button class="btn btn-check-all sessions-only" onclick="checkAll()" id="btnCheckAll">Check All Sessions</button>
@@ -1896,6 +1942,28 @@ const PANEL_HTML = `<!DOCTYPE html>
       <tbody id="lib-tbody"></tbody>
     </table>
   </div>
+  <div class="tab-panel" data-panel="accounts">
+    <div class="card">
+      <h3 style="margin-bottom:12px">Configured Accounts</h3>
+      <div id="acct-list"></div>
+      <hr style="margin:16px 0;border-color:#333">
+      <h3 style="margin-bottom:12px">Add Account</h3>
+      <form id="acct-form" style="display:flex;flex-direction:column;gap:8px;max-width:480px">
+        <input name="id" placeholder="Account ID (e.g. alice)" required>
+        <input name="label" placeholder="Label (e.g. My main account)" required>
+        <input name="browserDir" placeholder="Browser profile dir (e.g. data/browser-alice)" required>
+        <fieldset style="border:1px solid #333;padding:8px;border-radius:6px">
+          <legend style="color:#aaa;font-size:12px">Services (comma-separated)</legend>
+          <input name="services" placeholder="epic-games,gog,steam">
+        </fieldset>
+        <fieldset style="border:1px solid #333;padding:8px;border-radius:6px">
+          <legend style="color:#aaa;font-size:12px">Credentials (KEY=value per line)</legend>
+          <textarea name="env" rows="6" placeholder="EG_EMAIL=alice@example.com&#10;EG_PASSWORD=secret"></textarea>
+        </fieldset>
+        <button type="submit">Add Account</button>
+      </form>
+    </div>
+  </div>
 </div>
 <script>
 const NOVNC_PORT = ${NOVNC_PORT};
@@ -1974,6 +2042,7 @@ function switchTab(tab) {
   if (tab === 'settings') renderSettingsTab();
   if (tab === 'environment') renderEnvironmentTab();
   if (tab === 'library') { if (!document.getElementById('lib-tbody').children.length) loadLibrary(); }
+  if (tab === 'accounts') { loadAccounts(); }
 }
 
 async function renderEnvironmentTab() {
@@ -3614,6 +3683,63 @@ document.getElementById('lib-export')?.addEventListener('click', () => {
   a.click();
 });
 
+function renderAccountCard(acct) {
+  const div = document.createElement('div');
+  div.style.cssText = 'background:#1a1a2e;border:1px solid #333;border-radius:8px;padding:12px;display:flex;justify-content:space-between;align-items:center;margin-bottom:8px';
+  const info = document.createElement('div');
+  const name = document.createElement('strong');
+  name.textContent = acct.label;
+  const sub = document.createElement('div');
+  sub.style.cssText = 'color:#888;font-size:12px;margin-top:4px';
+  sub.textContent = 'ID: ' + acct.id + ' · Services: ' + ((acct.services || []).join(', ') || 'all') + ' · Dir: ' + (acct.browserDir || 'default');
+  info.appendChild(name);
+  info.appendChild(sub);
+  const del = document.createElement('button');
+  del.textContent = 'Delete';
+  del.style.cssText = 'background:#c0392b;border:none;color:white;padding:4px 10px;border-radius:4px;cursor:pointer;font-size:12px';
+  del.addEventListener('click', async () => {
+    if (!confirm('Delete account "' + acct.label + '"?')) return;
+    await fetch(BASE_PATH + '/api/accounts/' + encodeURIComponent(acct.id), { method: 'DELETE' });
+    loadAccounts();
+  });
+  div.appendChild(info);
+  div.appendChild(del);
+  return div;
+}
+
+async function loadAccounts() {
+  const res = await fetch(BASE_PATH + '/api/accounts');
+  const accounts = await res.json();
+  const list = document.getElementById('acct-list');
+  if (!accounts.length) {
+    list.textContent = 'No additional accounts configured. Default account comes from env vars.';
+    return;
+  }
+  list.replaceChildren(...accounts.map(renderAccountCard));
+}
+
+document.getElementById('acct-form')?.addEventListener('submit', async e => {
+  e.preventDefault();
+  const fd = new FormData(e.target);
+  const env = {};
+  for (const line of (fd.get('env') || '').split('\n').filter(Boolean)) {
+    const i = line.indexOf('=');
+    if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
+  }
+  const acct = {
+    id: fd.get('id').trim(), label: fd.get('label').trim(),
+    browserDir: fd.get('browserDir').trim(),
+    services: (fd.get('services') || '').split(',').map(s => s.trim()).filter(Boolean),
+    env,
+  };
+  const res = await fetch(BASE_PATH + '/api/accounts', {
+    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(acct),
+  });
+  if (res.ok) { e.target.reset(); loadAccounts(); }
+  else { const j = await res.json(); alert('Error: ' + j.error); }
+});
+
 </script>
 </body>
 </html>`;
@@ -3761,6 +3887,39 @@ const server = http.createServer(async (req, res) => {
         q:        p.get('q')        || undefined,
       });
       sendJson(res, result);
+      return;
+    }
+
+    if (req.method === 'GET' && req.url === '/api/accounts') {
+      if (!isAuthenticated(req)) { res.writeHead(401); res.end('Unauthorized'); return; }
+      sendJson(res, readAccounts().map(maskAccountCredentials));
+      return;
+    }
+
+    if (req.method === 'POST' && req.url === '/api/accounts') {
+      if (!isAuthenticated(req)) { res.writeHead(401); res.end('Unauthorized'); return; }
+      let body = '';
+      req.on('data', d => (body += d));
+      req.on('end', () => {
+        try {
+          const acct = JSON.parse(body);
+          if (!acct.id || !acct.label) { res.writeHead(400); res.end(JSON.stringify({ error: 'id and label required' })); return; }
+          const all = readAccounts();
+          if (all.find(a => a.id === acct.id)) { res.writeHead(409); res.end(JSON.stringify({ error: 'id already exists' })); return; }
+          all.push(acct);
+          writeAccounts(all);
+          res.writeHead(201, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(maskAccountCredentials(acct)));
+        } catch (e) { res.writeHead(400); res.end(JSON.stringify({ error: e.message })); }
+      });
+      return;
+    }
+
+    if (req.url.startsWith('/api/accounts/') && req.method === 'DELETE') {
+      if (!isAuthenticated(req)) { res.writeHead(401); res.end('Unauthorized'); return; }
+      const id = decodeURIComponent(req.url.slice('/api/accounts/'.length));
+      writeAccounts(readAccounts().filter(a => a.id !== id));
+      sendJson(res, { ok: true });
       return;
     }
 
