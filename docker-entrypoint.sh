@@ -2,54 +2,104 @@
 
 set -eo pipefail # exit on error, error on any fail in pipe (not just last cmd); add -x to print each cmd; see gist bash_strict_mode.md
 
-echo "Version: https://github.com/vogler/free-games-claimer/tree/${COMMIT}"
-[ ! -z $BRANCH ] && [ $BRANCH != "main" ] && echo "Branch: ${BRANCH}"
-echo "Build: $NOW"
+# --- Optional non-root mode (opt-in via PUID/PGID) ----------------------
+# When PUID is set and we're currently root, reconcile a runtime user `fgc`
+# with the requested UID/GID, fix ownership of writable paths, then re-exec
+# self as that user via gosu. Subsequent execution skips this block (id -u
+# is no longer 0). When PUID is unset, this block is skipped entirely and
+# the container runs as root exactly like prior releases — no behavior
+# change for existing deploys until they opt in by setting PUID.
+if [ "$(id -u)" = "0" ] && [ -n "$PUID" ]; then
+  PGID="${PGID:-$PUID}"
+  # Reconcile group + user. -o allows non-unique IDs which keeps things
+  # simple if PUID/PGID collide with existing system accounts.
+  if getent group fgc >/dev/null; then
+    groupmod -o -g "$PGID" fgc
+  else
+    groupadd -o -g "$PGID" fgc
+  fi
+  if id fgc >/dev/null 2>&1; then
+    usermod -o -u "$PUID" -g "$PGID" fgc >/dev/null
+  else
+    useradd -o -u "$PUID" -g "$PGID" -s /bin/bash -m -d /home/fgc fgc
+  fi
+  # Stale X11 / VNC files from a previous run may be owned by a different
+  # UID — clean them while we still have root.
+  rm -f /tmp/.X1-lock /tmp/.X11-unix/X1
+  rm -rf /home/fgc/.vnc/*.pid /home/fgc/.vnc/*.log 2>/dev/null || true
+  # Make sure paths the runtime user needs to write are owned by them.
+  mkdir -p /fgc/data /home/fgc/.vnc /home/fgc/.cache
+  chown -R "$PUID:$PGID" /fgc/data /home/fgc
+  # The browser cache is read-only at runtime (binaries only), but make
+  # sure the runtime user can traverse and read it. The Dockerfile already
+  # chmod a+rX'd it; this is belt-and-braces.
+  if [ -d "${PLAYWRIGHT_BROWSERS_PATH:-/usr/local/share/ms-playwright}" ]; then
+    chmod -R a+rX "${PLAYWRIGHT_BROWSERS_PATH:-/usr/local/share/ms-playwright}" 2>/dev/null || true
+  fi
+  echo "  Running as: fgc (uid=$PUID gid=$PGID) — non-root mode"
+  exec gosu fgc "$0" "$@"
+fi
+# -----------------------------------------------------------------------
+
+echo "══════════════════════════════════════════════════"
+echo "  Free Games Claimer"
+if [ -n "$COMMIT" ]; then
+  echo "  Version: ${COMMIT}"
+else
+  LOCAL_COMMIT=$(git -C /fgc rev-parse --short HEAD 2>/dev/null || echo "unknown")
+  echo "  Version: ${LOCAL_COMMIT}"
+fi
+echo "  Source:  https://github.com/vogler/free-games-claimer"
+[ -n "$BRANCH" ] && [ "$BRANCH" != "main" ] && echo "  Branch:  ${BRANCH}"
+if [ -n "$NOW" ]; then
+  echo "  Build:   $NOW"
+else
+  echo "  Build:   $(date -u '+%Y-%m-%d %H:%M:%S UTC') (local)"
+fi
+echo "══════════════════════════════════════════════════"
+
+BROWSER="${BROWSER_DIR:-data/browser}"
 
 # Remove chromium profile lock.
 # When running in docker and then killing it, on the next run chromium displayed a dialog to unlock the profile which made the script time out.
 # Maybe due to changed hostname of container or due to how the docker container kills playwright - didn't check.
 # https://bugs.chromium.org/p/chromium/issues/detail?id=367048
-rm -f /fgc/data/browser/SingletonLock
+rm -f "/fgc/$BROWSER/SingletonLock"
+rm -f "/fgc/${BROWSER}-mobile/SingletonLock"
 
-# Firefox preferences are stored in $BROWSER_DIR/pref.js and can be overridden by a file user.js
-# Since this file has to be in the volume (data/browser), we can't do this in Dockerfile.
-mkdir -p /fgc/data/browser
-# fix for 'Incorrect response' after solving a captcha correctly - https://github.com/vogler/free-games-claimer/issues/261#issuecomment-1868385830
-# echo 'user_pref("privacy.resistFingerprinting", true);' > /fgc/data/browser/user.js
-cat << EOT > /fgc/data/browser/user.js
-user_pref("privacy.resistFingerprinting", true);
-// user_pref("privacy.resistFingerprinting.letterboxing", true);
-// user_pref("browser.contentblocking.category", "strict");
-// user_pref("webgl.disabled", true);
-EOT
-# TODO disable session restore message?
-
-# Remove X server display lock, fix for `docker compose up` which reuses container which made it fail after initial run, https://github.com/vogler/free-games-claimer/issues/31
-# echo $DISPLAY
-# ls -l /tmp/.X11-unix/
-rm -f /tmp/.X11-lock
-
-# 6000+SERVERNUM is the TCP port Xvfb is listening on:
-# SERVERNUM=$(echo "$DISPLAY" | sed 's/:\([0-9][0-9]*\).*/\1/')
-
-# Options passed directly to the Xvfb server:
-# -ac disables host-based access control mechanisms
-# −screen NUM WxHxD creates the screen and sets its width, height, and depth
+# Clean up stale display/VNC files from previous runs.
+# Fixes container failing to start after stop/start (without recreate) on Unraid and similar platforms.
+rm -f /tmp/.X1-lock
+rm -f /tmp/.X11-unix/X1
+rm -f ~/.vnc/*:1.pid
+/opt/TurboVNC/bin/vncserver -kill :1 2>/dev/null || true
 
 export DISPLAY=:1 # need to export this, otherwise playwright complains with 'Looks like you launched a headed browser without having a XServer running.'
-Xvfb $DISPLAY -ac -screen 0 "${WIDTH}x${HEIGHT}x${DEPTH}" &
-echo "Xvfb display server created screen with resolution ${WIDTH}x${HEIGHT}"
 if [ -z "$VNC_PASSWORD" ]; then
-  pw="-nopw"
-  pwt="no password!"
+        pw="-SecurityTypes None"
+        pwt="no password!"
 else
-  pw="-passwd $VNC_PASSWORD"
-  pwt="with password"
+        # pw="-passwd $VNC_PASSWORD" # not supported anymore
+        pw="-rfbauth ~/.vnc/passwd"
+        mkdir -p ~/.vnc/
+        echo "$VNC_PASSWORD" | /opt/TurboVNC/bin/vncpasswd -f >~/.vnc/passwd
+        pwt="with password"
 fi
-x11vnc -display $DISPLAY -forever -shared -rfbport $VNC_PORT -bg $pw 2>/dev/null 1>&2
-echo "VNC is running on port $VNC_PORT ($pwt)"
-websockify -D --web "/usr/share/novnc/" $NOVNC_PORT "localhost:$VNC_PORT" 2>/dev/null 1>&2 &
-echo "noVNC (VNC via browser) is running on http://localhost:$NOVNC_PORT"
-echo
-exec tini -g -- "$@" # https://github.com/krallin/tini/issues/8 node/playwright respond to signals like ctrl-c, but unsure about zombie processes
+# TurboVNC server replaces Xvfb+x11vnc
+# shellcheck disable=SC2086
+/opt/TurboVNC/bin/vncserver $DISPLAY -geometry "${WIDTH}x${HEIGHT}" -depth "${DEPTH}" -rfbport "${VNC_PORT}" $pw -vgl -log /fgc/data/TurboVNC.log -xstartup /usr/bin/ratpoison 2>/dev/null # -noxstartup -novnc /usr/share/novnc/
+websockify -D --web "/usr/share/novnc/" "$NOVNC_PORT" "localhost:$VNC_PORT" 2>/dev/null 1>&2 &
+echo "  VNC:   port ${VNC_PORT} (${pwt}), ${WIDTH}x${HEIGHT}"
+echo "  noVNC: http://localhost:${NOVNC_PORT}/?autoconnect=true"
+
+# The panel process owns claim scheduling, session-lock coordination, and the
+# HTTP/noVNC surface. It reads LOOP / MS_SCHEDULE_HOURS / MS_SCHEDULE_START / CLAIM_CMD
+# and runs the claim scripts internally. LOGIN_MODE is a deprecated no-op — the
+# panel is always available now.
+if [ "$LOGIN_MODE" = "1" ]; then
+  echo "  (LOGIN_MODE=1 is deprecated — panel is always running; you can remove this env var)"
+fi
+# Restrict credential files to owner-only
+chmod 600 /fgc/data/accounts.json /fgc/data/config.env 2>/dev/null || true
+
+exec tini -s -g -- node interactive-login.js

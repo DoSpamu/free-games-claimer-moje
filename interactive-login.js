@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { watch, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync } from 'node:fs';
+import { watch, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 const __panelDirname = path.dirname(fileURLToPath(import.meta.url));
@@ -19,6 +19,14 @@ const SESSION_TTL_MS = { loggedIn: 30 * 60 * 1000, loggedOut: 5 * 60 * 1000 };
 function invalidateSession(siteId) { _sessionCache.delete(siteId); }
 
 const ACCOUNTS_FILE = dataDir('accounts.json');
+
+function checkFilePermissions(filePath, label) {
+  try {
+    if (!existsSync(filePath)) return;
+    const mode = statSync(filePath).mode;
+    if ((mode & 0o004) !== 0) log.warn(`${label} is world-readable (mode 0${(mode & 0o777).toString(8)}) — run: chmod 600 "${filePath}"`);
+  } catch {}
+}
 
 function readAccounts() {
   try {
@@ -1853,6 +1861,11 @@ const PANEL_HTML = `<!DOCTYPE html>
   <div class="compact-sessions sessions-only" id="compactSessions" onclick="toggleSessionsCollapsed()" title="Click to expand session details"></div>
   <button class="header-collapse sessions-only" id="btnHeaderCollapse" onclick="toggleSessionsCollapsed()" title="Collapse session details" aria-label="Collapse session details">▴</button>
 </div>
+<div id="cred-warn" style="display:none;background:#7c2d12;color:#fed7aa;padding:10px 14px;font-size:13px;position:sticky;top:0;z-index:50">
+  Credentials stored in data/accounts.json — ensure this file is not publicly accessible.
+  For better security, use environment variables or Docker secrets instead.
+  <button onclick="this.parentElement.style.display='none'" style="float:right;background:none;border:none;color:#fed7aa;cursor:pointer;font-size:16px">×</button>
+</div>
 <div class="main-area" id="mainArea">
   <div class="tab-panel" data-panel="sessions">
     <div class="vnc-container" id="vncContainer">
@@ -3612,6 +3625,10 @@ async function initialLoad() {
   await refreshState();
   updateBatchPolling();
   await handleDeepLink();
+  fetch(BASE_PATH + '/api/accounts').then(r => r.json()).then(accounts => {
+    const hasCreds = accounts.some(a => Object.keys(a.env || {}).length > 0);
+    if (hasCreds) document.getElementById('cred-warn').style.display = 'block';
+  }).catch(() => {});
 }
 initialLoad();
 setInterval(async () => {
@@ -3743,6 +3760,9 @@ document.getElementById('acct-form')?.addEventListener('submit', async e => {
 </script>
 </body>
 </html>`;
+
+checkFilePermissions(ACCOUNTS_FILE, 'data/accounts.json');
+checkFilePermissions(dataDir('config.env'), 'data/config.env');
 
 const server = http.createServer(async (req, res) => {
   try {
