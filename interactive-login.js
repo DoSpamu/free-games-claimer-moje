@@ -1,6 +1,6 @@
 import http from 'node:http';
 import { spawn, execFile } from 'node:child_process';
-import { watch, readFileSync, writeFileSync, existsSync, mkdirSync, renameSync, statSync } from 'node:fs';
+import { watch, readFileSync, existsSync, statSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 const __panelDirname = path.dirname(fileURLToPath(import.meta.url));
@@ -8,6 +8,7 @@ import { chromium, devices } from 'patchright';
 import { datetime, notify, jsonDb, normalizeTitle, dataDir } from './src/util.js';
 import { readLibrary } from './src/panel/library.js';
 import { makeCBHelpers } from './src/panel/circuit-breaker.js';
+import { ACCOUNTS_FILE, readAccounts, writeAccounts, maskAccountCredentials, getEffectiveAccounts } from './src/panel/accounts.js';
 import { cfg } from './src/config.js';
 import { describeConfig, patchConfig, describeEnv, getSchedulerConfig, CONFIG_FILE_PATH } from './src/app-config.js';
 
@@ -18,50 +19,12 @@ const SESSION_TTL_MS = { loggedIn: 30 * 60 * 1000, loggedOut: 5 * 60 * 1000 };
 
 function invalidateSession(siteId) { _sessionCache.delete(siteId); }
 
-const ACCOUNTS_FILE = dataDir('accounts.json');
-
 function checkFilePermissions(filePath, label) {
   try {
     if (!existsSync(filePath)) return;
     const mode = statSync(filePath).mode;
     if ((mode & 0o004) !== 0) log.warn(`${label} is world-readable (mode 0${(mode & 0o777).toString(8)}) — run: chmod 600 "${filePath}"`);
   } catch {}
-}
-
-function readAccounts() {
-  try {
-    if (!existsSync(ACCOUNTS_FILE)) return [];
-    return JSON.parse(readFileSync(ACCOUNTS_FILE, 'utf8')) || [];
-  } catch { return []; }
-}
-
-function writeAccounts(accounts) {
-  mkdirSync(path.dirname(ACCOUNTS_FILE), { recursive: true });
-  const tmp = ACCOUNTS_FILE + '.' + process.pid + '.tmp';
-  writeFileSync(tmp, JSON.stringify(accounts, null, 2) + '\n');
-  renameSync(tmp, ACCOUNTS_FILE);
-}
-
-const CRED_PATTERN = /password|otpkey|token|secret|key$/i;
-
-function maskAccountCredentials(account) {
-  const masked = { ...account, env: { ...account.env } };
-  for (const k of Object.keys(masked.env || {})) {
-    if (CRED_PATTERN.test(k)) {
-      const v = masked.env[k];
-      if (typeof v === 'string' && v.length > 4) masked.env[k] = '••••' + v.slice(-4);
-    }
-  }
-  return masked;
-}
-
-function getEffectiveAccounts() {
-  const configured = readAccounts();
-  const hasEnvCred = process.env.EMAIL || process.env.EG_EMAIL || process.env.GOG_EMAIL || process.env.STEAM_EMAIL;
-  const envAccount = hasEnvCred
-    ? [{ id: '_env', label: 'Default (env vars)', browserDir: null, services: [], env: {} }]
-    : [];
-  return [...envAccount, ...configured];
 }
 
 const PANEL_PORT = Number(process.env.PANEL_PORT) || 7080;
