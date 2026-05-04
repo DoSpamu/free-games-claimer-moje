@@ -41,6 +41,10 @@ if (cfg.time) console.time('startup');
 // headless:false required — SHOW=0 leads to captcha detection
 const context = await launchBrowser({ headless: false, harPrefix: 'eg', extraArgs: ['--ignore-gpu-blocklist', '--enable-unsafe-webgpu'] });
 
+if (!cfg.novnc_port && !cfg.show && process.platform !== 'win32' && !process.env.DISPLAY) {
+  log.warn('Epic Games runs non-headless (captcha avoidance). No display detected — ensure DISPLAY is set or run inside Docker with noVNC.');
+}
+
 if (cfg.debug) console.log(chromium.executablePath());
 
 handleSIGINT(context);
