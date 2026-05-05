@@ -448,8 +448,19 @@ export const log = {
 };
 
 export const launchBrowser = async (options = {}) => {
-  const { chromium } = await import('patchright');
   const { browserDir, harPrefix, extraArgs = [], headless = cfg.headless, deviceOptions = {} } = options;
+  if (process.env.BROWSER_TYPE === 'firefox') {
+    const { firefox } = await import('playwright');
+    return firefox.launchPersistentContext(browserDir ?? cfg.dir.browser, {
+      headless,
+      viewport: { width: cfg.width, height: cfg.height },
+      locale: 'en-US',
+      ...deviceOptions,
+      handleSIGINT: false,
+      firefoxUserPrefs: { 'dom.webdriver.enabled': false },
+    });
+  }
+  const { chromium } = await import('patchright');
   return chromium.launchPersistentContext(browserDir ?? cfg.dir.browser, {
     headless,
     viewport: { width: cfg.width, height: cfg.height },

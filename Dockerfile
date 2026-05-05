@@ -89,7 +89,11 @@ COPY package*.json ./
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright
 
 # --no-shell to avoid installing chromium_headless_shell (307MB) since headless mode could be detected without patching the browser itself
-RUN npm install --ignore-scripts && npx patchright install chromium --no-shell && du -h -d1 "$PLAYWRIGHT_BROWSERS_PATH" \
+RUN npm install --ignore-scripts \
+    && npx patchright install chromium --no-shell \
+    && npx playwright install firefox \
+    && npx playwright install-deps firefox \
+    && du -h -d1 "$PLAYWRIGHT_BROWSERS_PATH" \
     && chmod -R a+rX "$PLAYWRIGHT_BROWSERS_PATH"
 
 COPY . .

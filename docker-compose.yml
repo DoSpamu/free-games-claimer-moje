@@ -1,35 +1,71 @@
 # start with `docker compose up`
 services:
   free-games-claimer:
-    container_name: fgc # is printed in front of every output line
-    image: ghcr.io/dospamu/free-games-claimer:master # otherwise image name will be free-games-claimer-free-games-claimer
+    container_name: fgc
+    image: ghcr.io/dospamu/free-games-claimer:master
     build: .
-    healthcheck: # see Dockerfile, check that noVNC is reachable (node isn't running during LOOP sleep)
+    restart: unless-stopped
+    healthcheck:
       test: curl --fail http://localhost:6080 || exit 1
       interval: 30s
-      timeout: 5s
-      start_period: 15s
+      timeout: 10s
+      start_period: 20s
+      retries: 3
     ports:
-      # - "5900:5900" # VNC server
-      - "6080:6080" # noVNC (browser-based VNC client)
-      - "7080:7080" # control panel (always running)
+      - "6080:6080"  # noVNC — browser inside container (first login)
+      - "7080:7080"  # control panel (always running)
     volumes:
-      - fgc:/fgc/data
-    # command: bash -c "node epic-games; node gog; node steam"  # override CLAIM_CMD below instead
+      - /mnt/data/fgc:/fgc/data
+    labels:
+      com.centurylinklabs.watchtower.enable: "false"
     environment:
-      # - EMAIL=foo@bar.org
-      # - NOTIFY='tgram://...'
-      # - LOOP=28800 # scheduler interval in seconds (e.g., 28800 = 8 hours); omit to disable scheduler
-      # - BASE_PATH=/free-games # URL prefix if the panel is proxied under a subfolder
-      # - PUBLIC_URL=https://example.com/free-games # full external URL used in notifications
-      # - CLAIM_CMD='node gog.js; node prime-gaming.js; node epic-games.js; node steam.js; node microsoft.js' # full scheduled claim command (default includes all)
-      # - CLAIM_CMD_MANUAL='node gog.js; node prime-gaming.js; node epic-games.js; node steam.js' # "Run Now" button command (default skips microsoft.js since it sleeps internally until MS_SCHEDULE_START)
-      # - STEAM_MIN_RATING=6 # minimum review rating 1-9 (6 = Mostly Positive)
-      # - STEAM_MIN_PRICE=10 # minimum original price in USD
-      # - MS_EMAIL=your@email.com # Microsoft account for Bing Rewards (defaults to EMAIL)
-      # - MS_PASSWORD=yourpassword # Microsoft account password (defaults to PASSWORD)
-      # - MS_OTPKEY=yourotpsecret # Microsoft 2FA TOTP secret (optional)
-      # Note: LOGIN_MODE is deprecated — the panel is always running on port 7080.
+      TZ: Europe/Warsaw
+      BROWSER_TYPE: "firefox"
 
-volumes:
-  fgc:
+      # ── Scheduler ─────────────────────────────────────────────────────────────
+      LOOP: "86400"  # run claimers every N seconds (86400 = daily); 0 to disable
+      # CLAIM_CMD: "node gog.js; node prime-gaming.js; node epic-games.js; node steam.js; node microsoft.js"
+      # CLAIM_CMD_MANUAL: "node gog.js; node prime-gaming.js; node epic-games.js; node steam.js"
+
+      # ── Reverse proxy (uncomment if panel is served under a subfolder) ─────────
+      # BASE_PATH: /fgc
+      # PUBLIC_URL: https://yourserver.com/fgc
+
+      # ── Shared credentials ────────────────────────────────────────────────────
+      # EMAIL: your@email.com
+      # PASSWORD: yourpassword
+
+      # ── Epic Games ────────────────────────────────────────────────────────────
+      # EG_EMAIL: ""
+      # EG_PASSWORD: ""
+      # EG_OTPKEY: ""
+
+      # ── Prime Gaming ─────────────────────────────────────────────────────────
+      # PG_EMAIL: ""
+      # PG_PASSWORD: ""
+      # PG_OTPKEY: ""
+
+      # ── GOG ───────────────────────────────────────────────────────────────────
+      # GOG_EMAIL: ""
+      # GOG_PASSWORD: ""
+
+      # ── Steam ─────────────────────────────────────────────────────────────────
+      # STEAM_EMAIL: ""
+      # STEAM_PASSWORD: ""
+      # STEAM_OTPKEY: ""
+      # STEAM_MIN_RATING: "6"   # 1–9; 6 = Mostly Positive
+      # STEAM_MIN_PRICE: "10"   # minimum original price in USD
+
+      # ── Microsoft Rewards ─────────────────────────────────────────────────────
+      # MS_EMAIL: ""
+      # MS_PASSWORD: ""
+      # MS_OTPKEY: ""
+
+      # ── Notifications ─────────────────────────────────────────────────────────
+      # TG_TOKEN: ""
+      # TG_CHAT_ID: ""
+      # DISCORD_WEBHOOK: ""
+
+      # ── Opt-in services (disabled by default) ────────────────────────────────
+      # UBISOFT_ACTIVE: "1"
+      # AE_ACTIVE: "1"

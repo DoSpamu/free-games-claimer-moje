@@ -5,6 +5,18 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 const __panelDirname = path.dirname(fileURLToPath(import.meta.url));
 import { chromium } from 'patchright';
+
+async function launchContext(browserDir, options = {}) {
+  if (process.env.BROWSER_TYPE === 'firefox') {
+    const { firefox } = await import('playwright');
+    const { args: _args, ...rest } = options;
+    return firefox.launchPersistentContext(browserDir, {
+      ...rest,
+      firefoxUserPrefs: { 'dom.webdriver.enabled': false },
+    });
+  }
+  return chromium.launchPersistentContext(browserDir, options);
+}
 import { datetime, notify, jsonDb, normalizeTitle, dataDir } from './src/util.js';
 import { readLibrary } from './src/panel/library.js';
 import { makeCBHelpers } from './src/panel/circuit-breaker.js';
@@ -73,7 +85,7 @@ async function launchSite(siteId) {
 
   console.log(`[${datetime()}] Launching browser for ${site.name}...`);
 
-  const context = await chromium.launchPersistentContext(site.browserDir, {
+  const context = await launchContext(site.browserDir, {
     headless: false,
     viewport: { width: cfg.width, height: cfg.height },
     locale: 'en-US',
@@ -139,7 +151,7 @@ async function checkSiteStatus(siteId) {
 
   let context;
   try {
-    context = await chromium.launchPersistentContext(site.browserDir, {
+    context = await launchContext(site.browserDir, {
       headless: false,
       viewport: { width: 1280, height: 720 },
       locale: 'en-US',
@@ -472,7 +484,7 @@ async function startBatchRedeem() {
   if (!pending.length) throw new Error('No pending GOG codes to redeem.');
 
   console.log(`[${datetime()}] Starting batch redeem for ${pending.length} GOG code(s)...`);
-  const context = await chromium.launchPersistentContext(cfg.dir.browser, {
+  const context = await launchContext(cfg.dir.browser, {
     headless: false,
     viewport: { width: cfg.width, height: cfg.height },
     locale: 'en-US',
