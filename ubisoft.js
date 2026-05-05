@@ -66,7 +66,7 @@ for (const match of html.matchAll(/data-tc100="([^"]*)"/g)) {
   let data;
   try { data = JSON.parse(decoded); }
   catch { continue; }
-  if (!data.pid || !data.productName) continue;
+  if (!data || !data.pid || !data.productName) continue;
   if (data.action !== 'add to wishlist') continue; // dedupe to one tile shape
   if (products.has(data.pid)) continue;
   products.set(data.pid, { name: data.productName, edition: data.edition || 'unknown' });

@@ -146,7 +146,7 @@ ENV SHOW=1
 # means the panel process is responsive (not just that noVNC's HTTP listener
 # is up). With LOOP mode the claim scripts finish and the container sleeps
 # between cycles — that's normal, the panel stays up regardless.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s CMD curl --fail http://localhost:7080/api/state || exit 1
+HEALTHCHECK --interval=30s --timeout=5s --start-period=15s CMD curl --fail http://localhost:${NOVNC_PORT:-6080} || exit 1
 
 # Script to setup display server & VNC is always executed.
 ENTRYPOINT ["docker-entrypoint.sh"]
