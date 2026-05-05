@@ -2323,7 +2323,7 @@ document.getElementById('lib-export')?.addEventListener('click', () => {
     [g.title, g.platform, g.status, (g.time || '').slice(0, 10), g.url]
       .map(v => JSON.stringify(v || '')).join(',')
   );
-  const blob = new Blob([[hdr, ...rows].join('\n')], { type: 'text/csv' });
+  const blob = new Blob([[hdr, ...rows].join('\\n')], { type: 'text/csv' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
   a.download = 'library.csv';
@@ -2369,7 +2369,7 @@ document.getElementById('acct-form')?.addEventListener('submit', async e => {
   e.preventDefault();
   const fd = new FormData(e.target);
   const env = {};
-  for (const line of (fd.get('env') || '').split('\n').filter(Boolean)) {
+  for (const line of (fd.get('env') || '').split('\\n').filter(Boolean)) {
     const i = line.indexOf('=');
     if (i > 0) env[line.slice(0, i).trim()] = line.slice(i + 1).trim();
   }
