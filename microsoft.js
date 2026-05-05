@@ -712,6 +712,30 @@ async function recordMsRun(session, startedAt, before, after) {
   catch (e) { log.warn(`ms stats write failed: ${e.message}`); }
 }
 
+// Pre-flight: ensure both sessions are logged in before the long search phase.
+// Without this, a missing mobile login is only discovered hours later.
+log.section('Pre-flight login check');
+for (const isMobile of [false, true]) {
+  const label = isMobile ? 'Mobile' : 'Desktop';
+  const { context, page } = await createContext(isMobile);
+  activeContext = context;
+  try {
+    let loggedIn = await isLoggedIn(page);
+    if (!loggedIn) {
+      log.info(`${label}: not logged in — starting login flow now`);
+      await login(page);
+      loggedIn = await isLoggedIn(page);
+      if (!loggedIn) log.fail(`${label}: login failed — session will be skipped`);
+      else log.info(`${label}: login succeeded`);
+    } else {
+      log.info(`${label}: already logged in`);
+    }
+  } finally {
+    await context.close();
+    activeContext = null;
+  }
+}
+
 // Desktop session
 const sessionResults = { desktop: { before: null, after: null }, mobile: { before: null, after: null } };
 
