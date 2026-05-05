@@ -92,14 +92,21 @@ websockify -D --web "/usr/share/novnc/" "$NOVNC_PORT" "localhost:$VNC_PORT" 2>/d
 echo "  VNC:   port ${VNC_PORT} (${pwt}), ${WIDTH}x${HEIGHT}"
 echo "  noVNC: http://localhost:${NOVNC_PORT}/?autoconnect=true"
 
-# The panel process owns claim scheduling, session-lock coordination, and the
-# HTTP/noVNC surface. It reads LOOP / MS_SCHEDULE_HOURS / MS_SCHEDULE_START / CLAIM_CMD
-# and runs the claim scripts internally. LOGIN_MODE is a deprecated no-op — the
-# panel is always available now.
-if [ "$LOGIN_MODE" = "1" ]; then
-  echo "  (LOGIN_MODE=1 is deprecated — panel is always running; you can remove this env var)"
-fi
 # Restrict credential files to owner-only
 chmod 600 /fgc/data/accounts.json /fgc/data/config.env 2>/dev/null || true
+
+# Simple mode: skip the web panel, just run SIMPLE_CMD in a loop every LOOP seconds.
+if [ -n "$SIMPLE_CMD" ]; then
+  echo "  Mode:  simple (no panel) — running every ${LOOP:-86400}s"
+  echo "  Cmd:   $SIMPLE_CMD"
+  exec tini -s -g -- bash -c "
+    while true; do
+      echo \"[START] \$(date '+%Y-%m-%d %H:%M:%S')\"
+      eval \"\$SIMPLE_CMD\"
+      echo \"[DONE]  sleeping ${LOOP:-86400}s...\"
+      sleep \${LOOP:-86400}
+    done
+  "
+fi
 
 exec tini -s -g -- node interactive-login.js
