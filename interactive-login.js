@@ -17,7 +17,7 @@ async function launchContext(browserDir, options = {}) {
   }
   return chromium.launchPersistentContext(browserDir, { channel: 'chrome', ...options });
 }
-import { datetime, notify, jsonDb, normalizeTitle, dataDir } from './src/util.js';
+import { datetime, notify, jsonDb, normalizeTitle, dataDir, clearBrowserLock } from './src/util.js';
 import { readLibrary } from './src/panel/library.js';
 import { makeCBHelpers } from './src/panel/circuit-breaker.js';
 import { ACCOUNTS_FILE, readAccounts, writeAccounts, maskAccountCredentials, getEffectiveAccounts } from './src/panel/accounts.js';
@@ -84,6 +84,7 @@ async function launchSite(siteId) {
   if (!site) throw new Error(`Unknown site: ${siteId}`);
 
   console.log(`[${datetime()}] Launching browser for ${site.name}...`);
+  clearBrowserLock(site.browserDir);
 
   const context = await launchContext(site.browserDir, {
     headless: false,
@@ -151,6 +152,7 @@ async function checkSiteStatus(siteId) {
 
   let context;
   try {
+    clearBrowserLock(site.browserDir);
     context = await launchContext(site.browserDir, {
       headless: false,
       viewport: { width: 1280, height: 720 },
