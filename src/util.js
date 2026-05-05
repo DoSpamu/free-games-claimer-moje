@@ -461,7 +461,7 @@ export const launchBrowser = async (options = {}) => {
     });
   }
   const { chromium } = await import('patchright');
-  return chromium.launchPersistentContext(browserDir ?? cfg.dir.browser, {
+  const context = await chromium.launchPersistentContext(browserDir ?? cfg.dir.browser, {
     headless,
     viewport: { width: cfg.width, height: cfg.height },
     locale: 'en-US',
@@ -471,4 +471,6 @@ export const launchBrowser = async (options = {}) => {
     handleSIGINT: false,
     args: ['--hide-crash-restore-bubble', ...extraArgs],
   });
+  await stealth(context, generateFingerprint(cfg.width, cfg.height));
+  return context;
 };
