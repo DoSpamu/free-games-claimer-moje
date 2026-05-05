@@ -15,7 +15,7 @@ async function launchContext(browserDir, options = {}) {
       firefoxUserPrefs: { 'dom.webdriver.enabled': false },
     });
   }
-  return chromium.launchPersistentContext(browserDir, options);
+  return chromium.launchPersistentContext(browserDir, { channel: 'chrome', ...options });
 }
 import { datetime, notify, jsonDb, normalizeTitle, dataDir } from './src/util.js';
 import { readLibrary } from './src/panel/library.js';

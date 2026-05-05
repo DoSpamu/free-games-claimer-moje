@@ -462,6 +462,7 @@ export const launchBrowser = async (options = {}) => {
   }
   const { chromium } = await import('patchright');
   const context = await chromium.launchPersistentContext(browserDir ?? cfg.dir.browser, {
+    channel: 'chrome', // real Chrome binary — authentic TLS/HTTP2 fingerprint, no CDP artifacts
     headless,
     viewport: { width: cfg.width, height: cfg.height },
     locale: 'en-US',

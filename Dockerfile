@@ -88,6 +88,14 @@ COPY package*.json ./
 # same location and continues working.
 ENV PLAYWRIGHT_BROWSERS_PATH=/usr/local/share/ms-playwright
 
+# Install real Google Chrome (best Cloudflare Turnstile / hCaptcha bypass —
+# authentic TLS/HTTP2 fingerprint, no CDP artifacts that Playwright Chromium exposes).
+# patchright uses it via channel:'chrome' in launchPersistentContext.
+RUN wget -q -O /tmp/chrome.deb https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb \
+    && apt-get install -y --no-install-recommends /tmp/chrome.deb \
+    && rm /tmp/chrome.deb \
+    && apt-get clean && rm -rf /var/lib/apt/lists/*
+
 # --no-shell to avoid installing chromium_headless_shell (307MB) since headless mode could be detected without patching the browser itself
 RUN npm install --ignore-scripts \
     && npx patchright install chromium --no-shell \
