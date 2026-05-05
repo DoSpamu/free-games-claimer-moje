@@ -88,34 +88,36 @@ for (const [pid, info] of products) {
 const isFirstRun = Object.keys(prev.products).length === 0;
 saveState({ products: current });
 
-if (newEntries.length === 0) {
-  log.info('No new Ubisoft free games since last check');
-  process.exit(0);
+const newSet = new Set(newEntries.map(e => e.pid));
+const isF2P = e => /^free\s*to\s*play$/i.test(e.edition);
+const promoEntries = newEntries.filter(e => !isF2P(e));
+
+for (const [pid, info] of Object.entries(current)) {
+  const tag = newSet.has(pid) ? `new — ${info.edition}` : info.edition;
+  log.game(info.name, tag);
 }
 
 if (isFirstRun) {
-  // Don't spam on first enable — we don't know if any of these are actually
-  // new vs. just newly-tracked. Log them, save the baseline, no push.
-  log.info(`Baseline established with ${newEntries.length} entr${newEntries.length === 1 ? 'y' : 'ies'} (no notification on first run)`);
-  for (const e of newEntries) log.game(e.name, e.edition);
-  process.exit(0);
+  log.info(`Baseline established with ${products.size} game${products.size === 1 ? '' : 's'}`);
 }
 
-// Only notify for time-limited promotions, not new permanent F2P additions —
-// the latter are essentially never the "go grab this before it ends" signal
-// the user wants and they'd be noise. If Ubisoft introduces a new edition
-// label for promo events we should add it here; "Free to play" / "Free To
-// Play" is the only non-promo label observed so far.
-const promoEntries = newEntries.filter(e => !/^free\s*to\s*play$/i.test(e.edition));
-
-for (const e of newEntries) log.game(e.name, `new — ${e.edition}`);
-
-if (promoEntries.length === 0) {
-  log.info('All new entries are permanent free-to-play — no notification fired');
-  process.exit(0);
+// Alert for new time-limited promos (rare — quarterly events)
+if (promoEntries.length > 0) {
+  const lines = promoEntries.map(e => `<a href="${URL_FREE}">${e.name}</a> (${e.edition})`).join('<br>');
+  const subject = `Ubisoft — ${promoEntries.length} new promo game${promoEntries.length === 1 ? '' : 's'} — claim manually`;
+  log.info(subject);
+  await notify(`${subject}<br>${lines}`).catch(err => log.warn(`Notify failed: ${err.message.split('\n')[0]}`));
 }
 
-const lines = promoEntries.map(e => `<a href="${URL_FREE}">${e.name}</a> (${e.edition})`).join('<br>');
-const subject = `Ubisoft has ${promoEntries.length} new free game${promoEntries.length === 1 ? '' : 's'} — claim manually`;
-log.info(subject);
-await notify(`${subject}<br>${lines}`).catch(err => log.warn(`Notify failed: ${err.message.split('\n')[0]}`));
+// Daily summary — always send the full list so you know what's available
+{
+  const allLines = Object.entries(current)
+    .map(([pid, info]) => {
+      const isNew = newSet.has(pid) ? ' <b>(NEW)</b>' : '';
+      return `• ${info.name}${isNew} — ${info.edition}`;
+    })
+    .join('<br>');
+  const title = `Ubisoft free games check — ${products.size} game${products.size === 1 ? '' : 's'} on page`;
+  log.info(title);
+  await notify(`${title}<br>${allLines}`).catch(err => log.warn(`Notify failed: ${err.message.split('\n')[0]}`));
+}
