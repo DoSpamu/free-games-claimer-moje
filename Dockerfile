@@ -141,13 +141,6 @@ ENV DEPTH=24
 # Show browser instead of running headless
 ENV SHOW=1
 
-# Health check hits the always-on control panel API. /api/state returns JSON
-# describing per-site session status, scheduler info, etc., so a passing check
-# means the panel process is responsive (not just that noVNC's HTTP listener
-# is up). With LOOP mode the claim scripts finish and the container sleeps
-# between cycles — that's normal, the panel stays up regardless.
-HEALTHCHECK --interval=30s --timeout=5s --start-period=15s CMD curl --fail http://localhost:${NOVNC_PORT:-6080} || exit 1
-
 # Script to setup display server & VNC is always executed.
 ENTRYPOINT ["docker-entrypoint.sh"]
 # Default command to run. This is replaced by appending own command, e.g. `docker run ... node prime-gaming` to only run this script.
