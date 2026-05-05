@@ -89,10 +89,8 @@ const auth = async url => {
     const error = login.locator('.nfm-login-input-error-text');
     error.waitFor().then(async _ => console.error('Login error (please restart):', await error.innerText())).catch(_ => console.log('No login error.'));
     // AWSC slider can appear after Sign in. Race success-URL vs slider-trigger.
-    // If the slider wins, wrap the wait in awaitUserCaptchaSolve so the panel
-    // surfaces a banner + notification. If unsolved within the helper's 10min
-    // window, throw CAPTCHA_BLOCKED rather than falling through and stacking
-    // a second timeout in pre_auth.coins' waitForResponse.
+    // First attempt: auto-solve with Playwright mouse (smooth human-like drag).
+    // Fallback: awaitUserCaptchaSolve so the panel surfaces a banner + notification.
     const successUrl = u => u.toString().startsWith('https://www.aliexpress.com/');
     const sliderTrigger = page.locator(
       'iframe[src*="captcha"], iframe[src*="punish"], iframe[src*="nocaptcha"], iframe[src*="awsc"], iframe[src*="baxia"]'
@@ -114,18 +112,63 @@ const auth = async url => {
       }
       return textVisible;
     };
+
+    // Smooth human-like AWSC slider drag via Playwright mouse API.
+    // VNC mouse events are too coarse (fixed interval, no acceleration) for AWSC.
+    // Playwright sends events at sub-ms resolution with natural easing.
+    const solveSlider = async () => {
+      const awscFrame = page.frames().find(f => /captcha|nocaptcha|awsc|baxia/i.test(f.url() || ''));
+      const knobSel = '.btn_slide, .nc_iconfont.btn_slide, [class*="btn_slide"], [class*="slider-btn"]';
+      const trackSel = '.nc_scale, [class*="slider-track"], [class*="nc_scale"]';
+      const frame = awscFrame ? awscFrame : page.mainFrame();
+      const knob = frame.locator(knobSel).first();
+      const track = frame.locator(trackSel).first();
+      const knobBox = await knob.boundingBox().catch(() => null);
+      if (!knobBox) return false;
+      const trackBox = await track.boundingBox().catch(() => null);
+      const dragDist = trackBox ? trackBox.width - knobBox.width - 4 : 280;
+      const sx = knobBox.x + knobBox.width / 2;
+      const sy = knobBox.y + knobBox.height / 2;
+      await page.mouse.move(sx, sy, { steps: 3 });
+      await page.mouse.down();
+      await page.waitForTimeout(80 + Math.random() * 60);
+      const steps = 60;
+      for (let i = 1; i <= steps; i++) {
+        const t = i / steps;
+        // ease-in-out + slight overshoot near end
+        const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
+        const jitter = (Math.random() - 0.5) * 2;
+        await page.mouse.move(sx + dragDist * ease, sy + jitter);
+        await page.waitForTimeout(8 + Math.random() * 12);
+      }
+      await page.waitForTimeout(60 + Math.random() * 80);
+      await page.mouse.up();
+      await page.waitForTimeout(1200);
+      return !(await captchaCheck());
+    };
+
     await Promise.race([
       page.waitForURL(successUrl),
       sliderTrigger.waitFor({ state: 'visible' }).then(async () => {
-        const solved = await awaitUserCaptchaSolve(page, {
-          service: 'aliexpress',
-          label: 'slider after login',
-          captchaCheck,
-        });
-        if (!solved) {
-          const e = new Error('AliExpress slider verification not completed within timeout');
-          e.code = 'CAPTCHA_BLOCKED';
-          throw e;
+        // Try auto-solve up to 3 times before handing off to manual solve.
+        let autoSolved = false;
+        for (let attempt = 1; attempt <= 3 && !autoSolved; attempt++) {
+          console.log(`[SLIDER-AUTO] attempt=${attempt}`);
+          autoSolved = await solveSlider().catch(() => false);
+          if (!autoSolved && attempt < 3) await page.waitForTimeout(1500);
+        }
+        if (!autoSolved) {
+          console.log('[SLIDER-AUTO] failed — waiting for manual solve via noVNC');
+          const solved = await awaitUserCaptchaSolve(page, {
+            service: 'aliexpress',
+            label: 'slider after login',
+            captchaCheck,
+          });
+          if (!solved) {
+            const e = new Error('AliExpress slider verification not completed within timeout');
+            e.code = 'CAPTCHA_BLOCKED';
+            throw e;
+          }
         }
         await page.waitForURL(successUrl);
       }),
