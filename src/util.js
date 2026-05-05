@@ -454,10 +454,15 @@ export const launchBrowser = async (options = {}) => {
     return firefox.launchPersistentContext(browserDir ?? cfg.dir.browser, {
       headless,
       viewport: { width: cfg.width, height: cfg.height },
+      // Windows UA — avoids Linux/headless detection. Most common desktop profile, least suspicious.
+      userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:127.0) Gecko/20100101 Firefox/127.0',
       locale: 'en-US',
       ...deviceOptions,
       handleSIGINT: false,
-      firefoxUserPrefs: { 'dom.webdriver.enabled': false },
+      firefoxUserPrefs: {
+        'dom.webdriver.enabled': false,
+        'webgl.disabled': true, // blocks WebGL fingerprinting that reveals Swiftshader (Docker GPU)
+      },
     });
   }
   const { chromium } = await import('patchright');

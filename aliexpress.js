@@ -2,8 +2,8 @@
 // services.aliexpress.active === true (Settings → Per-service → AliExpress).
 // If you run it standalone on the CLI, it always executes; the activation
 // gate lives in interactive-login.js.
-import { chromium } from 'patchright';
-import { datetime, filenamify, prompt, handleSIGINT, jsonDb, clearBrowserLock, awaitUserCaptchaSolve, notify } from './src/util.js';
+import { firefox } from 'playwright';
+import { datetime, filenamify, prompt, handleSIGINT, jsonDb, clearBrowserLock, notify } from './src/util.js';
 import { cfg } from './src/config.js';
 import { FingerprintInjector } from 'fingerprint-injector';
 import { FingerprintGenerator } from 'fingerprint-generator';
@@ -24,13 +24,13 @@ const { fingerprint, headers } = new FingerprintGenerator().getFingerprint({
 
 clearBrowserLock(cfg.dir.browser + '-aliexpress');
 
-const context = await chromium.launchPersistentContext(cfg.dir.browser + '-aliexpress', {
+// Firefox + desktop URL avoids the AWSC slider that Chromium mobile triggers.
+const context = await firefox.launchPersistentContext(cfg.dir.browser + '-aliexpress', {
   headless: cfg.headless,
   locale: 'en-US',
   recordVideo: cfg.record ? { dir: 'data/record/', size: { width: cfg.width, height: cfg.height } } : undefined,
   recordHar: cfg.record ? { path: `data/record/aliexpress-${filenamify(datetime())}.har` } : undefined,
   handleSIGINT: false,
-  // mobile view is required — desktop URLs just show "install the app"
   userAgent: fingerprint.navigator.userAgent,
   viewport: {
     width: fingerprint.screen.width,
@@ -39,7 +39,7 @@ const context = await chromium.launchPersistentContext(cfg.dir.browser + '-aliex
   extraHTTPHeaders: {
     'accept-language': headers['accept-language'],
   },
-  args: ['--hide-crash-restore-bubble'],
+  firefoxUserPrefs: { 'dom.webdriver.enabled': false },
 });
 handleSIGINT(context);
 await new FingerprintInjector().attachFingerprintToPlaywright(context, { fingerprint, headers });
@@ -50,136 +50,37 @@ const page = context.pages().length ? context.pages()[0] : await context.newPage
 
 const auth = async url => {
   console.log('auth', url);
-  const loginBtn = page.locator('button:has-text("Log in")');
-  const loggedIn = page.locator('h3:text-is("day streak")');
-  // AliExpress mobile sometimes hangs on initial load — a manual F5 recovers it.
-  // Auto-reload up to 3 times if neither the login button nor the logged-in
-  // marker shows up within a short window.
-  const QUICK_WAIT_MS = 15000;
-  const MAX_RELOADS = 3;
-  for (let attempt = 0; attempt <= MAX_RELOADS; attempt++) {
-    if (attempt === 0) await page.goto(url, { waitUntil: 'domcontentloaded' });
-    else {
-      console.log(`Page stuck loading; reloading (attempt ${attempt}/${MAX_RELOADS})`);
-      await page.reload({ waitUntil: 'domcontentloaded' }).catch(_ => {});
-    }
-    const appeared = await Promise.any([
-      loginBtn.waitFor({ timeout: QUICK_WAIT_MS }).then(_ => true),
-      loggedIn.waitFor({ timeout: QUICK_WAIT_MS }).then(_ => true),
-    ]).catch(_ => false);
-    if (appeared) break;
-    if (attempt === MAX_RELOADS) throw new Error('AliExpress page never finished loading (login button / logged-in marker never appeared)');
-  }
-  await Promise.race([loginBtn.waitFor().then(async () => {
-    console.error('Not logged in! Will wait for 120s for you to login in the browser or terminal...');
-    context.setDefaultTimeout(120 * 1000);
-    await loginBtn.click();
-    page.getByRole('button', { name: 'Accept cookies' }).click().then(_ => console.log('Accepted cookies')).catch(_ => { });
-    page.locator('span:has-text("Switch account")').click().catch(_ => {});
-    const login = page.locator('#root');
-    const email = cfg.ae_email || await prompt({ message: 'Enter email' });
-    const emailInput = login.locator('input[label="Email or phone number"]');
-    await emailInput.fill(email);
-    await emailInput.blur();
-    const continueButton = login.locator('button:has-text("Continue")');
-    await continueButton.click({ force: true });
-    const password = email && (cfg.ae_password || await prompt({ type: 'password', message: 'Enter password' }));
-    await login.locator('input[label="Password"]').fill(password);
-    await login.locator('button:has-text("Sign in")').click();
-    const error = login.locator('.nfm-login-input-error-text');
-    error.waitFor().then(async _ => console.error('Login error (please restart):', await error.innerText())).catch(_ => console.log('No login error.'));
-    // AWSC slider can appear after Sign in. Race success-URL vs slider-trigger.
-    // First attempt: auto-solve with Playwright mouse (smooth human-like drag).
-    // Fallback: awaitUserCaptchaSolve so the panel surfaces a banner + notification.
-    const successUrl = u => u.toString().startsWith('https://www.aliexpress.com/');
-    const sliderTrigger = page.locator(
-      'iframe[src*="captcha"], iframe[src*="punish"], iframe[src*="nocaptcha"], iframe[src*="awsc"], iframe[src*="baxia"]'
-    ).or(page.locator('text=/slide.*verify|drag.*slider/i')).first();
-    let captchaDetectLogged = false;
-    const captchaCheck = async () => {
-      const matched = page.frames().find(f => /captcha|nocaptcha|punish_box|baxia|awsc/i.test(f.url() || ''));
-      if (matched) {
-        if (!captchaDetectLogged) {
-          captchaDetectLogged = true;
-          console.log(`[CAPTCHA-DETECT] service=aliexpress branch=frame frameUrl=${matched.url()} pageUrl=${page.url()}`);
-        }
-        return true;
-      }
-      const textVisible = await page.locator('text=/slide.*verify|drag.*slider|向右滑动/i').first().isVisible().catch(() => false);
-      if (textVisible && !captchaDetectLogged) {
-        captchaDetectLogged = true;
-        console.log(`[CAPTCHA-DETECT] service=aliexpress branch=text pageUrl=${page.url()}`);
-      }
-      return textVisible;
-    };
-
-    // Smooth human-like AWSC slider drag via Playwright mouse API.
-    // VNC mouse events are too coarse (fixed interval, no acceleration) for AWSC.
-    // Playwright sends events at sub-ms resolution with natural easing.
-    const solveSlider = async () => {
-      const awscFrame = page.frames().find(f => /captcha|nocaptcha|awsc|baxia/i.test(f.url() || ''));
-      const knobSel = '.btn_slide, .nc_iconfont.btn_slide, [class*="btn_slide"], [class*="slider-btn"]';
-      const trackSel = '.nc_scale, [class*="slider-track"], [class*="nc_scale"]';
-      const frame = awscFrame ? awscFrame : page.mainFrame();
-      const knob = frame.locator(knobSel).first();
-      const track = frame.locator(trackSel).first();
-      const knobBox = await knob.boundingBox().catch(() => null);
-      if (!knobBox) return false;
-      const trackBox = await track.boundingBox().catch(() => null);
-      const dragDist = trackBox ? trackBox.width - knobBox.width - 4 : 280;
-      const sx = knobBox.x + knobBox.width / 2;
-      const sy = knobBox.y + knobBox.height / 2;
-      await page.mouse.move(sx, sy, { steps: 3 });
-      await page.mouse.down();
-      await page.waitForTimeout(80 + Math.random() * 60);
-      const steps = 60;
-      for (let i = 1; i <= steps; i++) {
-        const t = i / steps;
-        // ease-in-out + slight overshoot near end
-        const ease = t < 0.5 ? 2 * t * t : -1 + (4 - 2 * t) * t;
-        const jitter = (Math.random() - 0.5) * 2;
-        await page.mouse.move(sx + dragDist * ease, sy + jitter);
-        await page.waitForTimeout(8 + Math.random() * 12);
-      }
-      await page.waitForTimeout(60 + Math.random() * 80);
-      await page.mouse.up();
-      await page.waitForTimeout(1200);
-      return !(await captchaCheck());
-    };
-
-    await Promise.race([
-      page.waitForURL(successUrl),
-      sliderTrigger.waitFor({ state: 'visible' }).then(async () => {
-        // Try auto-solve up to 3 times before handing off to manual solve.
-        let autoSolved = false;
-        for (let attempt = 1; attempt <= 3 && !autoSolved; attempt++) {
-          console.log(`[SLIDER-AUTO] attempt=${attempt}`);
-          autoSolved = await solveSlider().catch(() => false);
-          if (!autoSolved && attempt < 3) await page.waitForTimeout(1500);
-        }
-        if (!autoSolved) {
-          console.log('[SLIDER-AUTO] failed — waiting for manual solve via noVNC');
-          const solved = await awaitUserCaptchaSolve(page, {
-            service: 'aliexpress',
-            label: 'slider after login',
-            captchaCheck,
-          });
-          if (!solved) {
-            const e = new Error('AliExpress slider verification not completed within timeout');
-            e.code = 'CAPTCHA_BLOCKED';
-            throw e;
-          }
-        }
-        await page.waitForURL(successUrl);
-      }),
-    ]);
-    context.setDefaultTimeout(cfg.debug ? 0 : cfg.timeout);
-    console.log('Logged in!');
-  }), loggedIn.waitFor()]);
+  await page.goto(url, { waitUntil: 'domcontentloaded' });
+  await Promise.any([
+    page.waitForURL(/.*login\.aliexpress\.com.*/).then(async () => {
+      console.error('Not logged in! Will wait for 120s for you to login in the browser or terminal...');
+      context.setDefaultTimeout(120 * 1000);
+      page.locator('span:has-text("Switch account")').click().catch(_ => {});
+      const login = page.locator('.login-container');
+      const email = cfg.ae_email || await prompt({ message: 'Enter email' });
+      const emailInput = login.locator('input[label="Email or phone number"]');
+      await emailInput.fill(email);
+      await emailInput.blur();
+      const continueButton = login.locator('button:has-text("Continue")');
+      await continueButton.click({ force: true });
+      await continueButton.click();
+      const password = email && (cfg.ae_password || await prompt({ type: 'password', message: 'Enter password' }));
+      await login.locator('input[label="Password"]').fill(password);
+      await login.locator('button:has-text("Sign in")').click();
+      const error = login.locator('.error-text');
+      error.waitFor().then(async _ => console.error('Login error (please restart):', await error.innerText())).catch(_ => {});
+      await page.waitForURL(url);
+      page.getByRole('button', { name: 'Accept cookies' }).click().then(_ => console.log('Accepted cookies')).catch(_ => {});
+      context.setDefaultTimeout(cfg.debug ? 0 : cfg.timeout);
+      console.log('Logged in!');
+    }),
+    page.locator('#nav-user-account, .nav-user-account').waitFor(),
+  ]).catch(_ => {});
 };
 
 const urls = {
-  coins: 'https://m.aliexpress.com/p/coin-index/index.html',
+  // Desktop URL (Firefox) — avoids the AWSC slider that appears on mobile/Chromium
+  coins: 'https://www.aliexpress.com/p/coin-pc-index/index.html',
 };
 
 const pre_auth = {
@@ -199,19 +100,25 @@ const pre_auth = {
 
 const coins = async () => {
   console.log('Collecting coins...');
-  page.locator('.hideDoubleButton').click().catch(_ => {});
-  const collectBtn = page.locator('button:has-text("Collect")');
-  const moreBtn = page.locator('button:has-text("Earn more coins")');
+  // Desktop selectors first, mobile selectors as fallback
+  const collectBtn = page.locator('.checkin-button, button:has-text("Collect")').first();
+  const alreadyBtn = page.locator('.addcoin, button:has-text("Earn more coins")').first();
   await Promise.race([
     collectBtn.click({ force: true }).then(_ => { collected = true; console.log('Collected coins for today!'); }),
-    moreBtn.waitFor().then(_ => console.log('No more coins to collect today!')),
+    alreadyBtn.waitFor().then(_ => console.log('No more coins to collect today!')),
   ]);
   try {
-    streakDays = Number(await page.locator('h3:text-is("day streak")').locator('xpath=..').locator('div span').innerText());
+    const coinText = await page.locator('.mycoin-content-right-money').innerText().catch(() => null);
+    if (coinText) userCoinsNum = Number(coinText.replace(/[^\d]/g, '')) || userCoinsNum;
+    console.log('Total (coins):', userCoinsNum);
+  } catch {}
+  try {
+    streakDays = Number(await page.locator('.title-box, h3:text-is("day streak")').first().innerText());
     console.log('Streak (days):', streakDays);
   } catch {}
   try {
-    tomorrowCoins = Number((await page.locator(':text("coins tomorrow")').innerText()).replace(/Get (\d+) check-in coins tomorrow!/, '$1'));
+    const tomorrowText = await page.locator('.addcoin, :text("coins tomorrow")').first().innerText();
+    tomorrowCoins = Number(tomorrowText.replace(/\D+(\d+).*/s, '$1')) || null;
     console.log('Tomorrow (coins):', tomorrowCoins);
   } catch {}
   try {
