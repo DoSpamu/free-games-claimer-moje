@@ -96,17 +96,38 @@ echo "  noVNC: http://localhost:${NOVNC_PORT}/?autoconnect=true"
 chmod 600 /fgc/data/accounts.json /fgc/data/config.env 2>/dev/null || true
 
 # Simple mode: skip the web panel, just run SIMPLE_CMD in a loop every LOOP seconds.
+# Each semicolon-separated command is retried up to RETRY_MAX times (default 3)
+# with RETRY_DELAY seconds between attempts (default 300 = 5 min).
 if [ -n "$SIMPLE_CMD" ]; then
   echo "  Mode:  simple (no panel) — running every ${LOOP:-86400}s"
   echo "  Cmd:   $SIMPLE_CMD"
-  exec tini -s -g -- bash -c "
+  echo "  Retry: up to ${RETRY_MAX:-3}x with ${RETRY_DELAY:-300}s delay"
+  exec tini -s -g -- bash -c '
+    run_with_retry() {
+      local cmd="$1" attempt
+      for attempt in $(seq 1 "${RETRY_MAX:-3}"); do
+        echo "[RUN] $cmd"
+        eval "$cmd" && return 0
+        if [ "$attempt" -lt "${RETRY_MAX:-3}" ]; then
+          echo "[RETRY $attempt/${RETRY_MAX:-3}] failed — sleeping ${RETRY_DELAY:-300}s..."
+          sleep "${RETRY_DELAY:-300}"
+        else
+          echo "[FAIL] $cmd — giving up after ${RETRY_MAX:-3} attempts"
+        fi
+      done
+    }
     while true; do
-      echo \"[START] \$(date '+%Y-%m-%d %H:%M:%S')\"
-      eval \"\$SIMPLE_CMD\"
-      echo \"[DONE]  sleeping ${LOOP:-86400}s...\"
-      sleep \${LOOP:-86400}
+      echo "[START] $(date +"%Y-%m-%d %H:%M:%S")"
+      IFS=";" read -ra CMDS <<< "$SIMPLE_CMD"
+      for cmd in "${CMDS[@]}"; do
+        cmd="${cmd#"${cmd%%[![:space:]]*}"}"  # strip leading whitespace
+        [ -z "$cmd" ] && continue
+        run_with_retry "$cmd"
+      done
+      echo "[DONE]  sleeping ${LOOP:-86400}s..."
+      sleep "${LOOP:-86400}"
     done
-  "
+  '
 fi
 
 exec tini -s -g -- node interactive-login.js
