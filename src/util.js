@@ -248,33 +248,12 @@ export const notifyTelegram = async (html, opts = {}) => {
   }
 };
 
-export const notifyDiscord = async (games, fallbackText) => {
-  if (!cfg.discord_webhook) return;
-  try {
-    const relevant = (games || []).filter(g => g.status === 'claimed' || g.status === 'failed').slice(0, 10);
-    const embeds = relevant.map(g => ({
-      title: g.title,
-      url: g.url || undefined,
-      color: g.status === 'claimed' ? 0x57F287 : 0xED4245,
-      thumbnail: g.imageUrl ? { url: g.imageUrl } : undefined,
-      footer: { text: g.status },
-    }));
-    const payload = embeds.length ? { embeds } : { content: fallbackText };
-    const res = await fetch(cfg.discord_webhook, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    });
-    if (!res.ok) console.error('Discord notification error:', await res.text());
-  } catch (e) {
-    console.error('Discord notification failed:', e.message);
-  }
-};
+import { notifyFromHtml } from './discord.js';
 
 export const notify = (html, opts = {}) => {
   const tgImage = opts.games?.length === 1 ? opts.games[0].imageUrl : undefined;
   notifyTelegram(html, { imageUrl: tgImage }).catch(() => {});
-  notifyDiscord(opts.games || [], html).catch(() => {});
+  notifyFromHtml(opts.title || '', html).catch(() => {});
   if (!cfg.notify) {
     if (cfg.debug) console.debug('notify: NOTIFY is not set!');
     return Promise.resolve();
